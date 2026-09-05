@@ -87,6 +87,21 @@ RUN_REDIVIS_TESTS=1 python -m pytest tests/test_redivis_integration.py -v
 
 After releasing or sharing the update, ask users to **restart their Python session** so in-process caches pick up the new warehouse list.
 
+## MCP server (issue #1713)
+
+The optional MCP server lives in `src/irw/mcp.py` and is deliberately separate
+from the core API. Install it with `pip install "irw[mcp]"` on Python 3.10 or
+newer. The server uses the official MCP Python SDK over stdio and registers only
+the five read-only tools documented in the package README.
+
+Keep stdout clean: MCP protocol messages use stdout, while diagnostics belong
+on stderr. The adapter captures human-readable output and warnings emitted by
+the existing package APIs and returns warnings in the structured tool result.
+Do not add OpenAI or other model-provider dependencies to this package.
+
+Tests use a fake backend and do not require Redivis credentials. Live checks
+should remain opt-in through the existing `RUN_REDIVIS_TESTS=1` convention.
+
 
 ## Collections (issue #1633)
 

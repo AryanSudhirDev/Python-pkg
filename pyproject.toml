@@ -41,10 +41,18 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",
 ]
-
-
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
+
+[project.optional-dependencies]
+# The MCP SDK currently requires Python 3.10+. Keep the core package's Python
+# 3.9 support and make this feature opt-in.
+mcp = [
+    "mcp>=2.1,<3; python_version >= '3.10'",
+]
+
+[project.scripts]
+irw-mcp = "irw.mcp:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

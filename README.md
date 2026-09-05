@@ -105,6 +105,41 @@ irw.version()                         # newest IRW version and its dataset pins
 irw.version("2026-08-01")             # what was live on that date
 ```
 
+## MCP server
+
+IRW can run as a local, read-only Model Context Protocol server for an
+MCP-capable research assistant. The server exposes `search_tables`,
+`describe_table`, `fetch_table`, `get_itemtext`, and `list_collections`.
+
+The MCP server requires Python 3.10 or newer because the current MCP SDK does.
+It does not make OpenAI calls and does not require an OpenAI key; the host
+application is responsible for the model. Redivis authentication is still
+handled by the `irw` package.
+
+```bash
+python -m pip install "irw[mcp]"
+```
+
+Configure an MCP host to start this local process:
+
+```json
+{
+  "command": "irw-mcp",
+  "args": []
+}
+```
+
+`fetch_table` and `get_itemtext` always return bounded pages. They default to
+100 rows, accept an `offset`, and include `has_more` and `truncated` fields.
+The maximum is 1,000 response rows and 500 item-text rows. Item text may be
+reconstructed or incomplete; verify it against the original source, and note
+that response-data licenses do not automatically grant rights to reuse an
+instrument.
+
+The process uses stdio, so it is intended to be launched by a local MCP host.
+It is not a hosted HTTP endpoint and cannot be called directly by a static
+GitHub Pages browser widget.
+
 ## Development
 
 ### Setting up Development Environment
