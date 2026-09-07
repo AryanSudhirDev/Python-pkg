@@ -32,14 +32,25 @@ _TRANSIENT_ERROR_MARKERS = (
 
 
 def _get_table(ds: Any, name: str) -> Any:
-    """Get a table handle and ensure properties are loaded."""
+    """Get a table handle and ensure properties are loaded.
+
+    A missing table must surface as not-found here rather than being
+    swallowed: `_search_datasets` relies on that signal to move on to the
+    next shard. With it swallowed, `ds.table(name)` hands back a phantom
+    handle and the *first* shard searched claims every name -- which is how
+    item text for the 732 tables in `irw_text` came back "not available"
+    once the 15-table `irw_text_2` shard was put ahead of it. Other failures
+    (a transient property load) keep the lazy handle, as before; the fetch
+    that follows will raise properly if the table really is unreachable.
+    """
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*No reference id was provided for the table.*")
         tbl = ds.table(name)
         try:
             tbl.get()  # populate properties if needed
-        except Exception:
-            pass
+        except Exception as e:
+            if _classify_error(e) == "not_found":
+                raise
         return tbl
 
 
