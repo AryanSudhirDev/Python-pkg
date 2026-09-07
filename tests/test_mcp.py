@@ -903,3 +903,36 @@ def test_describe_filter_drops_missing_and_merges_repeated_values():
     result = IRWTools(_Messy(), FakeSource()).describe_filter("construct_type")
     assert result["available_values"] == ["a"]
     assert result["value_counts"] == {"a": 5}
+
+
+def test_structured_errors_reach_the_client_as_tool_errors():
+    """An IRWMCPError raised inside a tool must arrive as an is_error result
+    carrying its code and message. The SDK turns any other exception into
+    the bare line "Error executing tool <name>", so a wrapper that let the
+    error escape unconverted delivered every refusal as that one line."""
+    pytest.importorskip("mcp")
+
+    async def check():
+        from mcp import Client
+
+        async with Client(create_server(FakeBackend(), FakeSource())) as client:
+            result = await client.call_tool(
+                "fetch_table", {"table_name": "huge_assessment", "wide": True}
+            )
+            assert result.is_error is True
+            text = result.content[0].text
+            assert "table_too_large" in text
+            assert "50,000,000" in text
+
+            result = await client.call_tool("search_tables", {"filters": {"bogus": 1}})
+            assert result.is_error is True
+            assert "invalid_input" in result.content[0].text
+            assert "bogus" in result.content[0].text
+
+            result = await client.call_tool(
+                "fetch_table", {"table_name": "alpha_depression", "columns": ["zeta"]}
+            )
+            assert result.is_error is True
+            assert "zeta" in result.content[0].text
+
+    asyncio.run(check())

@@ -1721,7 +1721,24 @@ def create_server(
         instructions=SERVER_INSTRUCTIONS,
     )
 
+    from mcp.server.mcpserver.exceptions import ToolError
     from mcp.types import ToolAnnotations
+
+    def deliver(call: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+        """Hand a structured error to the model instead of losing it.
+
+        The SDK treats any exception other than its own ToolError as a crash:
+        the client gets the bare text "Error executing tool <name>" and the
+        code, message and retryable flag that IRWMCPError carries stay in the
+        server log. Every refusal this server makes -- table_too_large, an
+        unknown column, a missing credential -- was reaching the assistant
+        as that one uninformative line. Raising ToolError with the JSON
+        payload puts it in the is_error result the model reads.
+        """
+        try:
+            return call()
+        except IRWMCPError as error:
+            raise ToolError(str(error)) from None
 
     read_only = ToolAnnotations(
         readOnlyHint=True,
@@ -1747,7 +1764,7 @@ def create_server(
         limit: int = SEARCH_DEFAULT_LIMIT,
         offset: int = 0,
     ) -> Dict[str, Any]:
-        return tools.search_tables(query, filters, limit, offset)
+        return deliver(lambda: tools.search_tables(query, filters, limit, offset))
 
     @server.tool(name="describe_filter", annotations=read_only, structured_output=True)
     def describe_filter(filter_name: str) -> Dict[str, Any]:
@@ -1758,12 +1775,12 @@ def create_server(
         "mental health"), and a value that matches nothing returns an empty
         result that looks exactly like an absence of data.
         """
-        return tools.describe_filter(filter_name)
+        return deliver(lambda: tools.describe_filter(filter_name))
 
     @server.tool(name="describe_table", annotations=read_only, structured_output=True)
     def describe_table(table_name: str) -> Dict[str, Any]:
         """Return metadata and statistics for one IRW table without fetching rows."""
-        return tools.describe_table(table_name)
+        return deliver(lambda: tools.describe_table(table_name))
 
     @server.tool(name="fetch_table", annotations=read_only, structured_output=True)
     def fetch_table(
@@ -1800,7 +1817,7 @@ def create_server(
         may vary across items. Duplicate id-item pairs can be real data
         (trials, waves, raters); they are kept unless dedup=true.
         """
-        return tools.fetch_table(table_name, limit, offset, columns, wide, dedup)
+        return deliver(lambda: tools.fetch_table(table_name, limit, offset, columns, wide, dedup))
 
     @server.tool(name="get_itemtext", annotations=read_only, structured_output=True)
     def get_itemtext(
@@ -1819,7 +1836,7 @@ def create_server(
         reproduce a scale on its strength. Text is reconstructed with partial
         review; verify against the source.
         """
-        return tools.get_itemtext(table_name, limit, offset)
+        return deliver(lambda: tools.get_itemtext(table_name, limit, offset))
 
     @server.tool(name="list_collections", annotations=read_only, structured_output=True)
     def list_collections(
@@ -1827,7 +1844,7 @@ def create_server(
         offset: int = 0,
     ) -> Dict[str, Any]:
         """List IRW's labelled collections and their metadata."""
-        return tools.list_collections(limit, offset)
+        return deliver(lambda: tools.list_collections(limit, offset))
 
     @server.tool(name="get_citation", annotations=read_only, structured_output=True)
     def get_citation(table_name: str) -> Dict[str, Any]:
@@ -1835,7 +1852,7 @@ def create_server(
 
         Cite the original producers, not only the IRW, when using a table.
         """
-        return tools.get_citation(table_name)
+        return deliver(lambda: tools.get_citation(table_name))
 
     @server.tool(
         name="get_processing_notes", annotations=read_only, structured_output=True
@@ -1850,7 +1867,7 @@ def create_server(
         `match` says how the script was found: exact, prefix (a multi-table
         script), or none.
         """
-        return tools.get_processing_notes(table_name)
+        return deliver(lambda: tools.get_processing_notes(table_name))
 
     return server
 
