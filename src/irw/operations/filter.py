@@ -216,6 +216,7 @@ def filter_tables(
     item_format: Optional[Union[str, List[str]]] = None,
     language: Optional[Union[str, List[str]]] = None,
     longitudinal: Optional[bool] = None,
+    has_item_text: Optional[bool] = None,
     license: Optional[Union[str, List[str]]] = None,
     collection: Optional[Union[str, List[str]]] = None,
 ) -> pd.Series:
@@ -296,6 +297,11 @@ def filter_tables(
         Filter longitudinal datasets.
         - True: include only datasets flagged as longitudinal
         - False: exclude datasets flagged as longitudinal
+        - None: no filter (default)
+    has_item_text : bool or None, optional
+        Filter by whether reconstructed item text is available.
+        - True: include only datasets with item text
+        - False: exclude datasets with item text
         - None: no filter (default)
     
     license : str or list of str, optional
@@ -381,6 +387,14 @@ def filter_tables(
     
     # Apply variable presence filter
     df = _apply_variable_filter(df, var)
+
+    # has_item_text is a plain boolean column on list_tables, the same shape
+    # as longitudinal. It was filterable by slicing list_tables and not
+    # through filter(), and a gap like that is what makes a caller
+    # reimplement the filtering instead of calling it.
+    if has_item_text is not None:
+        _require_column(df, 'has_item_text')
+        df = df[df['has_item_text'] == has_item_text].copy()
     
     # Apply tag filters (using cleaned-up column names from list_tables)
     if age_range is not None:

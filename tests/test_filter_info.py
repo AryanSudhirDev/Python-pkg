@@ -69,3 +69,35 @@ def test_missing_tags_are_not_counted_as_a_value(patched):
     values = filter_info.describe_filter([], "sample")["values"]
     assert "nan" not in values.index
     assert values.sum() == 5  # 2 + 2 + 1, from three tagged tables
+
+
+def test_every_filter_description_names_a_real_filter_argument():
+    """The drift guard: FILTER_DESCRIPTIONS is the list callers are shown, and
+    filter_tables' signature is the list that works. A name in one and not the
+    other is either a filter nobody can find or one that raises TypeError."""
+    import inspect
+
+    from irw.operations.filter import filter_tables
+    from irw.operations.filter_info import FILTER_DESCRIPTIONS
+
+    parameters = set(inspect.signature(filter_tables).parameters) - {"datasets"}
+    assert set(FILTER_DESCRIPTIONS) == parameters
+
+
+def test_has_item_text_is_filterable():
+    import pandas as pd
+    from unittest.mock import patch
+
+    from irw.operations.filter import filter_tables
+
+    frame = pd.DataFrame(
+        {
+            "name": ["with_text", "without_text"],
+            "has_item_text": [True, False],
+            "density": [1.0, 1.0],
+        }
+    )
+    with patch("irw.operations.filter.list_tables", return_value=frame):
+        assert filter_tables([], has_item_text=True).tolist() == ["with_text"]
+        assert filter_tables([], has_item_text=False).tolist() == ["without_text"]
+        assert sorted(filter_tables([]).tolist()) == ["with_text", "without_text"]

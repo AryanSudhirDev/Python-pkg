@@ -27,6 +27,7 @@ FILTER_DESCRIPTIONS = {
     'item_format': 'Item format (e.g., "Likert Scale/selected response"). Use a single string or a list of strings for OR logic.',
     'language': 'Primary language used (e.g., "eng"). Use a single string or a list of strings for OR logic.',
     'longitudinal': 'Whether the dataset is longitudinal (i.e., has wave or date variables). Use True to include only longitudinal datasets, False to exclude longitudinal datasets, or None for no filter.',
+    'has_item_text': 'Whether reconstructed item text is available for the dataset. Use True for tables with item text, False for those without, or None for no filter. Item text is available for a minority of tables and is reconstructed from source documents with partial review, so its absence is not a judgement about the response data.',
     'license': 'Dataset license type (e.g., "CC BY 4.0"). Use a single string or a list of strings for OR logic.',
     'collection': 'Collection membership (e.g., "rct", "big_five", "depression"). Collections are labelled groupings of IRW tables -- study designs, instrument families and constructs. A table can be in several at once. Use a single string or a list of strings for OR logic (the union, not the intersection). See irw.collections() for what exists, and note the coverage column: collections derived from tags searched only ~62% of tables, so they are not exhaustive.'
 }
