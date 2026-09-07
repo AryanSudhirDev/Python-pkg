@@ -12,7 +12,9 @@ unopenable shard skipped rather than fatal.
 
 ## Adding a main IRW Redivis warehouse
 
-Main IRW response tables can span multiple Redivis datasets ("warehouses"). To add another one (e.g. a 7th warehouse), **only update `MAIN_REFS` in `src/irw/config.py`**:
+Main IRW response tables can span multiple Redivis datasets ("warehouses").
+Within *this package*, adding another one (e.g. a 7th warehouse) means updating
+`MAIN_REFS` in `src/irw/config.py` and nothing else:
 
 ```python
 MAIN_REFS: ClassVar[Tuple[Tuple[str, str], ...]] = (
@@ -27,7 +29,10 @@ MAIN_REFS: ClassVar[Tuple[Tuple[str, str], ...]] = (
 
 Each entry is `(redivis_user, dataset_ref)`, where `dataset_ref` is the Redivis dataset slug (e.g. `item_response_warehouse_6:xxxx`).
 
-No other code changes are needed. The package automatically:
+No other code change is needed **here** -- but this package is one of three
+that declare the same dataset list, and the other two are not optional. See
+[Adding a warehouse everywhere else](#adding-a-warehouse-everywhere-else)
+before opening a pull request. Within the package, it automatically:
 
 - initializes every warehouse listed in `MAIN_REFS`
 - lists tables from all of them (`list_tables`, `filter`, `info`, etc.)
@@ -112,3 +117,43 @@ Three things to know before changing any of it:
 Adding a collection needs no change here at all — it is one line in
 `src/collections/registry.csv` in the main repo. That is the point of the long
 format. See `Rpkg/inst/developer/collections.md`.
+
+
+## Adding a warehouse everywhere else
+
+The dataset list is declared once per language, because there are three clients
+in three runtimes with no shared build:
+
+| repo | file | carries |
+|---|---|---|
+| `Python-pkg` | `src/irw/config.py` | names **+ version hashes** |
+| `Rpkg` | `R/redivis-config.R` | names **+ version hashes** |
+| `irw` | `metadata/redivis_config.R` | dataset **names** only |
+
+All three must list the same datasets, in the same order for the sharded
+sources (`MAIN_REFS` and `ITEMTEXT_REFS` here). The order is not cosmetic: every
+client searches shards newest-first so a table resolves to its most recent copy,
+and a file listing them differently would quietly resolve some tables to a stale
+shard while every name still matched.
+
+A shard added here and nowhere else is reachable from Python and invisible from
+R -- and the reverse has already happened. `irw_nominal` was in both R configs
+and in no Python file at all, so `source="nom"` did not exist for Python users
+for months; it was found by hand rather than by anything mechanical
+(`ben-domingue/irw#1733`).
+
+The duplication is deliberate. Publishing the registry as a Redivis table was
+considered and rejected: it would put a network round-trip and a bootstrap
+dependency in every client's cold start, so a client that could not reach
+Redivis could no longer learn its own configuration. Instead,
+`irw/metadata/check_config_parity.py` compares the three on every pull request
+to the `irw` repository and fails when they disagree.
+
+**Land this package and `Rpkg` before `irw`.** The check reads both packages at
+their default branch, so while a shard exists in `irw` and not yet here, it
+reports a real disagreement and the `irw` pull request stays red. Merging the
+two package pull requests first makes it pass. That ordering is intended, not a
+limitation to work around -- during that window the configs genuinely disagree.
+
+The full cross-repo runbook, including the Redivis and metadata steps that have
+no Python side, is `Rpkg/inst/developer/warehouses.md`.
