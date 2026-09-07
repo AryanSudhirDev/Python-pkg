@@ -120,7 +120,9 @@ refuses before downloading.
 **Do not reimplement the package inside the adapter.** `search_tables` takes a
 `filters` object, validates the names against `irw.get_filters()` and passes
 it to `irw.filter()`; the tool description and the per-filter caveats are
-generated from `describe_filter()`. The first version of the server filtered
+generated from `FILTER_DESCRIPTIONS`, not `describe_filter()`, because the
+latter loads the metadata tables to compute each filter's values and must
+not run at server startup. The first version of the server filtered
 over `list_tables()` by hand, accepted five filters where the package had
 nineteen, and dropped the coverage caveats `FILTER_DESCRIPTIONS` already
 carried -- which is how "no match" starts reading as "no data". If a filter is

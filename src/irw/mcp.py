@@ -459,6 +459,74 @@ def _validate_columns(columns: Optional[List[str]]) -> Optional[List[str]]:
     return normalized
 
 
+DESCRIBE_FILTER_MAX_VALUES = 300
+
+
+def _filter_values(values: Any, state: "_ConversionState") -> Dict[str, Any]:
+    """Normalise irw.describe_filter()['values'] into one shape.
+
+    The package returns a different type per filter kind: a dict of summary
+    statistics for numeric filters, a pandas Series of counts indexed by value
+    for tag, licence, variable and collection filters, and a {True: n,
+    False: n} dict for the boolean ones. An assistant needs the same three
+    keys every time -- `available_values` is the list it may pass back to
+    search_tables, `value_counts` says how common each is, and `summary` is
+    the numeric range -- so the shape is fixed here rather than left to
+    whatever pandas happened to produce.
+    """
+    if isinstance(values, pd.Series):
+        # A missing index entry is not a value anyone can filter on, and a
+        # repeated one is one value counted twice; neither should reach the
+        # list an assistant copies from.
+        merged: Dict[Any, int] = {}
+        for key, count in values.dropna().items():
+            if _is_missing(key):
+                continue
+            key = _jsonable(key, state, path="filter.values")
+            merged[key] = merged.get(key, 0) + int(count)
+        pairs = list(merged.items())
+    elif isinstance(values, Mapping):
+        keys = {str(k) for k in values}
+        if keys and keys <= {"True", "False", "true", "false"}:
+            pairs = [(bool(k in (True, "True", "true")), int(v)) for k, v in values.items()]
+        else:
+            return {
+                "kind": "numeric",
+                "available_values": None,
+                "value_counts": None,
+                "summary": _jsonable(dict(values), state, path="filter.values"),
+                "truncated": False,
+            }
+    elif values is None:
+        return {
+            "kind": "unknown",
+            "available_values": None,
+            "value_counts": None,
+            "summary": None,
+            "truncated": False,
+        }
+    else:
+        pairs = [(_jsonable(v, state, path="filter.values"), None) for v in _iter_values(values)]
+
+    truncated = len(pairs) > DESCRIBE_FILTER_MAX_VALUES
+    if truncated:
+        state.add(
+            f"{len(pairs)} distinct values; only the {DESCRIBE_FILTER_MAX_VALUES} "
+            "most common are listed."
+        )
+        pairs = pairs[:DESCRIBE_FILTER_MAX_VALUES]
+    kind = "boolean" if pairs and all(isinstance(k, bool) for k, _ in pairs) else "categorical"
+    return {
+        "kind": kind,
+        "available_values": [k for k, _ in pairs],
+        "value_counts": (
+            {str(k): v for k, v in pairs} if all(v is not None for _, v in pairs) else None
+        ),
+        "summary": None,
+        "truncated": truncated,
+    }
+
+
 def _name_set(value: Any) -> set:
     """Table names from whatever irw.filter() handed back, casefolded.
 
@@ -847,7 +915,11 @@ class IRWTools:
                     "variables": (
                         None
                         if _is_missing(variables)
-                        else re.split(r"[\s,;]+", str(variables).strip())
+                        else [
+                            v
+                            for v in re.split(r"[\s,;|]+", str(variables).strip())
+                            if v
+                        ]
                     ),
                     "license": None if _is_missing(licence) else str(licence),
                     "has_item_text": _as_bool(raw.get("has_item_text")),
@@ -971,19 +1043,24 @@ class IRWTools:
         state = _ConversionState()
         for message in package_warnings:
             state.add(message)
-        if details is None:
-            raise IRWMCPError(
-                "not_found",
-                f"No description is available for filter '{filter_name}'.",
-            )
-        payload = _jsonable(details, state, path="filter")
-        if not isinstance(payload, Mapping):
-            payload = {"description": payload}
+        # A None here is a filter the package can name but not enumerate --
+        # today n_categories, has_item_text and collection on the shipped
+        # package -- so fall back to its description rather than deny a
+        # filter that irw.filter() accepts exists.
+        if isinstance(details, Mapping):
+            description = details.get("description")
+            raw_values = details.get("values", details.get("available_values"))
+        else:
+            description, raw_values = details, None
+        if _is_missing(description):
+            description = self._filter_description(filter_name)
+        normalised = _filter_values(raw_values, state)
         return self._stamp(
             {
                 "source": SOURCE,
                 "filter": filter_name,
-                **dict(payload),
+                "description": None if _is_missing(description) else str(description),
+                **normalised,
                 "warnings": state.warnings,
             }
         )
@@ -1708,6 +1785,10 @@ def create_server(
         Because only the window is downloaded, `total_rows` is null and
         `has_more` says whether the window came back full;
         `total_rows_estimate` carries the catalogue's response count.
+        A page is the table's first rows in storage order, not a random
+        sample: use it to confirm the shape matches the metadata, not to
+        estimate anything about the table. describe_table has the
+        statistics.
 
         wide=true and dedup=true are the exception. Both describe the whole
         table, so they cannot be bounded to a page: the call downloads the

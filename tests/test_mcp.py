@@ -28,10 +28,13 @@ class FakeBackend:
                     "Depression follow-up",
                 ],
                 "collections": [["depression", "instrument"], ["math"], ["depression"]],
+                # The metadata table's real format: pipe-separated, with a
+                # space after each pipe. A split that forgets the pipe leaves
+                # "id|" as a column name and refuses every real column.
                 "variables": [
-                    "id item resp cov_age",
-                    "id item resp",
-                    "id item resp wave",
+                    "id| item| resp| cov_age",
+                    "id| item| resp",
+                    "id| item| resp| wave",
                 ],
                 "license": ["CC BY", "CC0", "CC BY"],
                 "longitudinal": [False, False, True],
@@ -131,10 +134,14 @@ class FakeBackend:
 
     def describe_filter(self, filter_name):
         self.describe_filter_calls.append(filter_name)
-        return {
-            "description": f"How {filter_name} works.",
-            "available_values": ["a", "b"],
-        }
+        # The shapes irw.describe_filter() really returns, one per kind.
+        if filter_name == "n_items":
+            values = {"min": 3.0, "max": 40.0, "mean": 12.5, "median": 10.0, "count": 4}
+        elif filter_name == "longitudinal":
+            values = {True: 1, False: 3}
+        else:
+            values = pd.Series([3, 1], index=["a", "b"], name=filter_name)
+        return {"description": f"How {filter_name} works.", "values": values}
 
     def filter_descriptions(self):
         return {name: f"How {name} works." for name in self.filter_names()}
@@ -290,7 +297,10 @@ def test_search_query_still_matches_fields_the_card_omits(tools):
 def test_describe_filter_reports_the_packages_own_values(tools):
     result = tools.describe_filter("construct_type")
     assert result["description"] == "How construct_type works."
+    assert result["kind"] == "categorical"
     assert result["available_values"] == ["a", "b"]
+    assert result["value_counts"] == {"a": 3, "b": 1}
+    assert result["summary"] is None
     with pytest.raises(IRWMCPError) as error:
         tools.describe_filter("nonsense")
     assert error.value.code == "invalid_input"
@@ -816,3 +826,80 @@ def test_invalid_request_detail_is_sanitised():
     assert "item_response_warehouse" not in str(raised.value)
     assert "zeta" in str(raised.value)
 
+
+def test_describe_filter_gives_every_kind_the_same_shape(tools):
+    """The package hands back a stats dict, a Series or a bool dict depending
+    on the filter. An assistant reads one shape: available_values is the list
+    it may pass to search_tables, summary is the numeric range."""
+    numeric = tools.describe_filter("n_items")
+    assert numeric["kind"] == "numeric"
+    assert numeric["available_values"] is None
+    assert numeric["summary"]["min"] == 3.0
+    assert numeric["summary"]["max"] == 40.0
+
+    boolean = tools.describe_filter("longitudinal")
+    assert boolean["kind"] == "boolean"
+    assert boolean["available_values"] == [True, False]
+    assert boolean["value_counts"] == {"True": 1, "False": 3}
+
+
+def test_describe_filter_caps_a_long_vocabulary():
+    from irw.mcp import DESCRIBE_FILTER_MAX_VALUES
+
+    class _Wide(FakeBackend):
+        def describe_filter(self, filter_name):
+            n = DESCRIBE_FILTER_MAX_VALUES + 50
+            return {
+                "description": "wide",
+                "values": pd.Series(range(n, 0, -1), index=[f"v{i}" for i in range(n)]),
+            }
+
+    result = IRWTools(_Wide(), FakeSource()).describe_filter("construct_type")
+    assert result["truncated"] is True
+    assert len(result["available_values"]) == DESCRIBE_FILTER_MAX_VALUES
+    assert result["available_values"][0] == "v0"
+    assert any("most common" in w for w in result["warnings"])
+
+
+def test_describe_filter_falls_back_to_the_description_text_when_values_are_missing():
+    """A filter the package can name but not enumerate is still a filter."""
+
+    class _Bare(FakeBackend):
+        def describe_filter(self, filter_name):
+            return None
+
+    result = IRWTools(_Bare(), FakeSource()).describe_filter("construct_type")
+    assert result["description"] == "How construct_type works."
+    assert result["kind"] == "unknown"
+    assert result["available_values"] is None
+
+
+def test_column_check_reads_the_pipe_separated_variable_list(tools):
+    """Regression: the catalogue lists variables as "id| item| resp". Splitting
+    on whitespace alone produced {"id|", "item|", "resp"}, so a request for
+    the id column was refused as unknown on every table in the corpus."""
+    result = tools.fetch_table("alpha_depression", columns=["id", "resp"], limit=1)
+    assert result["columns"][0]["name"] == "id"
+    assert tools.backend.fetch_calls[-1]["columns"] == ["id", "resp"]
+
+    with pytest.raises(IRWMCPError) as error:
+        tools.fetch_table("alpha_depression", columns=["zeta"], limit=1)
+    assert error.value.code == "invalid_input"
+    assert "zeta" in str(error.value)
+    assert "id|" not in str(error.value)
+
+
+def test_describe_filter_drops_missing_and_merges_repeated_values():
+    """A NaN index entry is not a value, and a repeated one is one value."""
+    import numpy as np
+
+    class _Messy(FakeBackend):
+        def describe_filter(self, filter_name):
+            return {
+                "description": "messy",
+                "values": pd.Series([2, 1, 3], index=["a", np.nan, "a"]),
+            }
+
+    result = IRWTools(_Messy(), FakeSource()).describe_filter("construct_type")
+    assert result["available_values"] == ["a"]
+    assert result["value_counts"] == {"a": 5}
