@@ -753,3 +753,66 @@ def test_filter_results_that_are_not_a_series_still_resolve():
     assert _name_set(np.array(["A"])) == {"a"}
     assert _name_set(pd.DataFrame({"name": ["A"]})) == {"a"}
     assert _name_set(None) == set()
+
+
+class _RaisingBackend(FakeBackend):
+    """A backend whose fetch raises what Redivis actually raises."""
+
+    def __init__(self, error):
+        super().__init__()
+        self._error = error
+
+    def fetch_table(self, table_name, **kwargs):
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    "error, code, retryable",
+    [
+        # Quota arrives wearing an invalid_request code; only the description
+        # says what it is. A mapper reading the code alone calls it bad input.
+        (
+            RuntimeError(
+                {
+                    "error": "invalid_request",
+                    "error_description": "You cannot export more than 5.0 GB "
+                    "within a 30 day period.",
+                }
+            ),
+            "quota_exceeded",
+            False,
+        ),
+        # The bare not_found code, underscore and all.
+        (RuntimeError({"error": "not_found", "message": "Table missing"}), "not_found", False),
+        (RuntimeError("401 unauthenticated"), "authentication_required", False),
+        (ConnectionError("Read timed out."), "upstream_unavailable", True),
+        # No message at all: the type is the only evidence, and it is enough.
+        (TimeoutError(), "upstream_unavailable", True),
+        (ConnectionResetError(), "upstream_unavailable", True),
+        (
+            RuntimeError({"error": "invalid_request", "error_description": "Bad column"}),
+            "invalid_input",
+            False,
+        ),
+        (ValueError("something else entirely"), "upstream_error", False),
+    ],
+)
+def test_package_errors_are_classified_by_the_package(error, code, retryable):
+    tools = IRWTools(_RaisingBackend(error), FakeSource())
+    with pytest.raises(IRWMCPError) as raised:
+        tools.fetch_table("alpha_depression")
+    assert raised.value.code == code
+    assert raised.value.retryable is retryable
+
+
+def test_invalid_request_detail_is_sanitised():
+    error = RuntimeError(
+        "invalid_request: item_response_warehouse_3:ab12 has no column zeta"
+    )
+    tools = IRWTools(_RaisingBackend(error), FakeSource())
+    with pytest.raises(IRWMCPError) as raised:
+        tools.fetch_table("alpha_depression")
+    assert raised.value.code == "invalid_input"
+    assert "item_response_warehouse" not in str(raised.value)
+    assert "zeta" in str(raised.value)
+

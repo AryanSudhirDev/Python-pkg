@@ -31,6 +31,7 @@ import pandas as pd
 import irw
 
 from .operations.list_tables import IRWMetadataUnavailable
+from .utils.redivis.tables import _classify_error, _sanitize_error
 
 logger = logging.getLogger(__name__)
 
@@ -138,28 +139,6 @@ _METADATA_KEY_MAP = {
     "Derived_License": "license",
     "BibTex": "bibtex",
 }
-_TRANSIENT_MARKERS = (
-    "timeout",
-    "temporar",
-    "connection",
-    "server error",
-    "502",
-    "503",
-    "incomplete read",
-    "remotedisconnected",
-    "read timed out",
-    "protocolerror",
-)
-_AUTH_MARKERS = (
-    "authentication",
-    "unauthorized",
-    "credentials",
-    "permission denied",
-    "login required",
-    "access token",
-)
-
-
 class IRWMCPError(RuntimeError):
     """A safe, machine-readable error returned by an MCP tool."""
 
@@ -356,35 +335,59 @@ def _warning_messages(caught: List[warnings.WarningMessage]) -> List[str]:
 
 
 def _map_exception(error: Exception) -> IRWMCPError:
+    """Turn whatever the package raised into a structured, safe error.
+
+    Classification is the package's, not ours: ``_classify_error`` is the one
+    place that knows a Redivis quota error arrives wearing an
+    ``invalid_request`` code, that the machine-readable code lives in
+    ``args[0]["error"]`` rather than the message, and that ``not_found`` is
+    spelt with an underscore. A second list of substrings here would drift
+    from it the first time Redivis changed a message.
+    """
     if isinstance(error, IRWMCPError):
         return error
-
-    message = str(error).casefold()
     if isinstance(error, IRWMetadataUnavailable):
         return IRWMCPError(
             "upstream_unavailable",
             "IRW metadata could not be loaded. Check network access and try again.",
             retryable=True,
         )
-    if any(marker in message for marker in _AUTH_MARKERS):
-        return IRWMCPError(
-            "authentication_required",
-            "Redivis authentication is required. Authenticate with the IRW "
-            "package and retry.",
-        )
-    if "not found" in message or "not_found" in message:
-        return IRWMCPError("not_found", "The requested IRW resource was not found.")
-    if "quota" in message:
+
+    kind = _classify_error(error)
+    # The classifier reads message text, and a bare TimeoutError() or
+    # ConnectionResetError() carries none. The type says what the text
+    # would have.
+    if kind == "unknown" and (
+        isinstance(error, (TimeoutError, ConnectionError))
+        or re.search(r"timeout|connection", type(error).__name__, re.IGNORECASE)
+    ):
+        kind = "transient"
+    if kind == "quota":
         return IRWMCPError(
             "quota_exceeded",
             "The Redivis export quota for this account is exhausted. Wait for "
             "the quota to reset before fetching more data.",
         )
-    if any(marker in message for marker in _TRANSIENT_MARKERS):
+    if kind == "auth":
+        return IRWMCPError(
+            "authentication_required",
+            "Redivis authentication is required. Authenticate with the IRW "
+            "package and retry.",
+        )
+    if kind == "not_found":
+        return IRWMCPError("not_found", "The requested IRW resource was not found.")
+    if kind == "transient":
         return IRWMCPError(
             "upstream_unavailable",
             "The IRW data service was temporarily unavailable. Retry the request.",
             retryable=True,
+        )
+    if kind == "invalid_request":
+        detail = _sanitize_error(str(error))
+        return IRWMCPError(
+            "invalid_input",
+            "Redivis rejected the request as invalid"
+            + (f": {detail}" if detail else ".")
         )
     return IRWMCPError(
         "upstream_error",
