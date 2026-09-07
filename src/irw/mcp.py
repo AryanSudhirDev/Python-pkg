@@ -35,6 +35,24 @@ from .operations.list_tables import IRWMetadataUnavailable
 logger = logging.getLogger(__name__)
 
 SOURCE = "main"
+# The card returned per search hit. The full metadata record runs ~220 tokens,
+# so a default page of 20 spent ~5.5k of the assistant's context and a maximum
+# page ~28k -- most of it the `variables` string and the bibliography, which
+# nobody reads twenty at a time. describe_table still returns everything.
+SEARCH_CARD_FIELDS = (
+    "name",
+    "construct_type",
+    "n_responses",
+    "n_participants",
+    "n_items",
+    "n_categories",
+    "density",
+    "longitudinal",
+    "license",
+    "has_item_text",
+    "collections",
+)
+
 SEARCH_DEFAULT_LIMIT = 20
 SEARCH_MAX_LIMIT = 100
 ROW_DEFAULT_LIMIT = 100
@@ -58,6 +76,22 @@ ITEMTEXT_ISSUES_QMD_URL = (
 ITEMTEXT_ISSUES_PAGE = "https://itemresponsewarehouse.org/itemtext_issues.html"
 PROCESSING_NOTES_MAX_LINES = 120
 PROCESSING_NOTES_MAX_CHARS = 8000
+
+# IRW records two licences per table: the Original License of the source
+# deposit and the Derived License IRW redistributes its own extract under.
+# Only the derived one reaches this server -- the biblio table the package
+# reads carries `Derived_License` and nothing else, while `Original License`
+# lives in the data dictionary and is not exported. So the field is reported
+# as null with its provenance stated, rather than the derived licence being
+# quietly passed off as the answer to a question about the source.
+ORIGINAL_LICENSE_NOTE = (
+    "IRW records an Original License for the source deposit separately from "
+    "the Derived License above, but it is not carried in the metadata this "
+    "server can read, so it is reported as null rather than guessed. A "
+    "restrictive derived licence does not imply a restrictive original one, "
+    "or the reverse. Check the table's entry in the IRW data dictionary "
+    "before relying on either."
+)
 
 INSTRUMENT_RIGHTS_NOTE = (
     "The licence recorded for a table covers its response data only. It does "
@@ -148,7 +182,21 @@ class IRWBackend(Protocol):
 
     def describe_table(self, table_name: str) -> Any: ...
 
-    def fetch_table(self, table_name: str, *, wide: bool, dedup: bool) -> Any: ...
+    def fetch_table(
+        self,
+        table_name: str,
+        *,
+        wide: bool,
+        dedup: bool,
+        max_rows: Optional[int] = None,
+        columns: Optional[List[str]] = None,
+    ) -> Any: ...
+
+    def filter_tables(self, **filters: Any) -> Any: ...
+
+    def filter_names(self) -> List[str]: ...
+
+    def describe_filter(self, filter_name: str) -> Any: ...
 
     def itemtext(self, table_name: str) -> Any: ...
 
@@ -183,8 +231,32 @@ class PackageBackend:
     def describe_table(self, table_name: str) -> Any:
         return irw.info(table_name, source=SOURCE, return_dict=True)
 
-    def fetch_table(self, table_name: str, *, wide: bool, dedup: bool) -> Any:
-        return irw.fetch(table_name, source=SOURCE, wide=wide, dedup=dedup)
+    def fetch_table(
+        self,
+        table_name: str,
+        *,
+        wide: bool,
+        dedup: bool,
+        max_rows: Optional[int] = None,
+        columns: Optional[List[str]] = None,
+    ) -> Any:
+        return irw.fetch(
+            table_name,
+            source=SOURCE,
+            wide=wide,
+            dedup=dedup,
+            max_rows=max_rows,
+            columns=columns,
+        )
+
+    def filter_tables(self, **filters: Any) -> Any:
+        return irw.filter(**filters)
+
+    def filter_names(self) -> List[str]:
+        return list(irw.get_filters())
+
+    def describe_filter(self, filter_name: str) -> Any:
+        return irw.describe_filter(filter_name)
 
     def itemtext(self, table_name: str) -> Any:
         return irw.itemtext(table_name)
@@ -373,6 +445,30 @@ def _validate_columns(columns: Optional[List[str]]) -> Optional[List[str]]:
     return normalized
 
 
+def _name_set(value: Any) -> set:
+    """Table names from whatever irw.filter() handed back, casefolded.
+
+    filter() returns a pandas Series today. _iter_values would treat one as a
+    single opaque value -- a Series is neither a Mapping nor a list -- and the
+    set would come out holding one stringified frame, which matches nothing
+    and reads as "no such tables".
+    """
+    if _is_missing(value):
+        return set()
+    if isinstance(value, pd.Series):
+        items = value.tolist()
+    elif isinstance(value, pd.DataFrame):
+        column = "name" if "name" in value.columns else value.columns[0]
+        items = value[column].tolist()
+    elif isinstance(value, (list, tuple, set, frozenset, np.ndarray)):
+        items = list(value)
+    elif isinstance(value, str):
+        items = [value]
+    else:
+        items = list(value) if hasattr(value, "__iter__") else [value]
+    return {str(item).casefold() for item in items if not _is_missing(item)}
+
+
 def _iter_values(value: Any) -> List[Any]:
     if _is_missing(value):
         return []
@@ -479,15 +575,19 @@ def _page_dataframe(
     for message in initial_warnings:
         state.add(message)
 
+    # Columnar, not a list of row objects: a row object repeats every column
+    # name on every row, which for a 1,000-row page is the column names a
+    # thousand times over -- about half the response and none of the content.
+    # `columns` below names the fields, in order, for every row.
     rows = []
     for row_index, values in enumerate(
         view.itertuples(index=False, name=None), start=offset
     ):
         rows.append(
-            {
-                name: _jsonable(value, state, path=f"{row_key}[{row_index}].{name}")
+            [
+                _jsonable(value, state, path=f"{row_key}[{row_index}].{name}")
                 for name, value in zip(selected_names, values)
-            }
+            ]
         )
 
     schema = [
@@ -633,6 +733,7 @@ class GitHubSource:
     def __init__(self, fetch_text: Optional[Callable[[str], str]] = None) -> None:
         self._fetch = fetch_text or _http_get_text
         self._scripts: Optional[List[str]] = None
+        self._scripts_truncated = False
         self._issues: Optional[Dict[str, List[str]]] = None
         self._overrides: Optional[Dict[str, List[Dict[str, str]]]] = None
         self._files: Dict[str, str] = {}
@@ -640,6 +741,11 @@ class GitHubSource:
     def data_scripts(self) -> List[str]:
         if self._scripts is None:
             payload = json.loads(self._fetch(IRW_REPO_TREE_URL))
+            # GitHub silently caps a recursive tree and says so only in this
+            # flag. A capped listing looks exactly like a repository with
+            # fewer scripts in it, which would turn "no processing notes for
+            # this table" into a false statement rather than an error.
+            self._scripts_truncated = bool(payload.get("truncated"))
             self._scripts = sorted(
                 entry["path"]
                 for entry in payload.get("tree", [])
@@ -647,6 +753,10 @@ class GitHubSource:
                 and str(entry.get("path", "")).startswith("data/")
             )
         return self._scripts
+
+    @property
+    def scripts_truncated(self) -> bool:
+        return self._scripts_truncated
 
     def read_script(self, path: str) -> str:
         if path not in self._files:
@@ -687,6 +797,8 @@ class IRWTools:
         self._irw_released_at: Optional[str] = None
         self._irw_version_checked = False
         self._catalogue_cache: Optional[Dict[str, Dict[str, Any]]] = None
+        self._filter_names: Optional[List[str]] = None
+        self._filter_descriptions: Dict[str, Optional[str]] = {}
 
     def _catalogue(self) -> Dict[str, Dict[str, Any]]:
         """Quota-free per-table facts from the metadata table, by lowercase name.
@@ -714,9 +826,15 @@ class IRWTools:
                 except (TypeError, ValueError):
                     n_responses = None
                 licence = raw.get("Derived_License", raw.get("license"))
+                variables = raw.get("variables")
                 catalogue[key] = {
                     "name": str(name),
                     "n_responses": n_responses,
+                    "variables": (
+                        None
+                        if _is_missing(variables)
+                        else re.split(r"[\s,;]+", str(variables).strip())
+                    ),
                     "license": None if _is_missing(licence) else str(licence),
                     "has_item_text": _as_bool(raw.get("has_item_text")),
                     "tagged": _is_tagged(raw),
@@ -745,6 +863,9 @@ class IRWTools:
             )
         rights = {
             "response_data_license": facts.get("license"),
+            "response_data_license_field": "Derived License",
+            "original_license": None,
+            "original_license_note": ORIGINAL_LICENSE_NOTE,
             "instrument_rights": INSTRUMENT_RIGHTS_NOTE,
             "public_notes": notes,
             "public_notes_url": ITEMTEXT_ISSUES_PAGE,
@@ -808,30 +929,130 @@ class IRWTools:
                 warning_list.append(message)
         return payload
 
+    def filter_names(self) -> List[str]:
+        """The package's own filter list, cached per process.
+
+        Read rather than restated: a hand-kept copy is a list that goes stale
+        the first time `irw.filter()` gains an argument, and the failure mode
+        is an assistant reporting that IRW cannot filter on something it can.
+        """
+        if self._filter_names is None:
+            names, _ = self._call(self.backend.filter_names)
+            self._filter_names = [str(name) for name in names]
+        return self._filter_names
+
+    def describe_filter(self, filter_name: str) -> Dict[str, Any]:
+        """What one filter means and which values it actually takes."""
+        filter_name = _validate_text(filter_name, "filter_name")
+        known = self.filter_names()
+        if filter_name not in known:
+            raise IRWMCPError(
+                "invalid_input",
+                f"Unknown filter '{filter_name}'. IRW filters on: "
+                f"{', '.join(known)}.",
+            )
+        details, package_warnings = self._call(
+            self.backend.describe_filter, filter_name
+        )
+        state = _ConversionState()
+        for message in package_warnings:
+            state.add(message)
+        if details is None:
+            raise IRWMCPError(
+                "not_found",
+                f"No description is available for filter '{filter_name}'.",
+            )
+        payload = _jsonable(details, state, path="filter")
+        if not isinstance(payload, Mapping):
+            payload = {"description": payload}
+        return self._stamp(
+            {
+                "source": SOURCE,
+                "filter": filter_name,
+                **dict(payload),
+                "warnings": state.warnings,
+            }
+        )
+
+    def _validate_filters(self, filters: Any) -> Dict[str, Any]:
+        """Check filter names against the package before spending a call on them."""
+        if filters is None:
+            return {}
+        if not isinstance(filters, Mapping):
+            raise IRWMCPError(
+                "invalid_input",
+                "filters must be an object of filter name to value, for "
+                'example {"construct_type": "Cognitive", "n_items": [10, 50]}.',
+            )
+        known = self.filter_names()
+        cleaned: Dict[str, Any] = {}
+        for key, value in filters.items():
+            name = str(key)
+            if name not in known:
+                raise IRWMCPError(
+                    "invalid_input",
+                    f"Unknown filter '{name}'. IRW filters on: "
+                    f"{', '.join(known)}. Call describe_filter for the values "
+                    "one of them takes.",
+                )
+            if value is None:
+                continue
+            cleaned[name] = value
+        return cleaned
+
     def search_tables(
         self,
         query: str = "",
-        collection: Optional[str] = None,
-        variable: Optional[str] = None,
-        license: Optional[str] = None,
-        longitudinal: Optional[bool] = None,
-        has_item_text: Optional[bool] = None,
+        filters: Optional[Mapping[str, Any]] = None,
         limit: int = SEARCH_DEFAULT_LIMIT,
         offset: int = 0,
     ) -> Dict[str, Any]:
+        """Free-text search over the catalogue, narrowed by `irw.filter()`.
+
+        The filtering is the package's, not ours. An adapter that reimplements
+        it drifts from it -- the first version of this server accepted five
+        filters where the package has nineteen, applied them with its own
+        matching rules, and dropped the coverage caveats the package already
+        carries in FILTER_DESCRIPTIONS. Those caveats are the load-bearing
+        part for an assistant: a filter that quietly restricts the search to
+        the tagged subset turns "no match" into "no data", which is a
+        confident wrong answer rather than a missing feature.
+        """
         query = _validate_text(query, "query", allow_empty=True)
-        if collection is not None:
-            collection = _validate_text(collection, "collection")
-        if variable is not None:
-            variable = _validate_text(variable, "variable")
-        if license is not None:
-            license = _validate_text(license, "license")
-        if longitudinal is not None:
-            longitudinal = _validate_bool(longitudinal, "longitudinal")
-        if has_item_text is not None:
-            has_item_text = _validate_bool(has_item_text, "has_item_text")
+        selected = self._validate_filters(filters)
         limit = _validate_limit(limit, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT)
         offset = _validate_offset(offset)
+
+        state = _ConversionState()
+        allowed: Optional[set[str]] = None
+        if selected:
+            # irw.filter() defaults density to [0.5, 1] and warns when that
+            # drops tables. A caller who asked for nothing about density did
+            # not ask for sparse tables to disappear, so opt out unless they
+            # named it -- and let the package's own warning through when they
+            # did.
+            call_filters = dict(selected)
+            call_filters.setdefault("density", None)
+            names, filter_warnings = self._call(
+                self.backend.filter_tables, **call_filters
+            )
+            for message in filter_warnings:
+                state.add(message)
+            allowed = _name_set(names)
+            if not allowed:
+                return self._stamp(
+                    {
+                        "source": SOURCE,
+                        "tables": [],
+                        "total": 0,
+                        "offset": offset,
+                        "limit": limit,
+                        "has_more": False,
+                        "filters_applied": selected,
+                        "caveats": self._search_caveats(selected, None, None),
+                        "warnings": state.warnings,
+                    }
+                )
 
         frame, package_warnings = self._call(self.backend.list_tables)
         if not isinstance(frame, pd.DataFrame):
@@ -841,7 +1062,6 @@ class IRWTools:
 
         query_casefold = query.casefold()
         query_tokens = re.findall(r"\w+", query_casefold, flags=re.UNICODE)
-        state = _ConversionState()
         for message in package_warnings:
             state.add(message)
         matches: List[Tuple[int, str, Dict[str, Any]]] = []
@@ -859,38 +1079,28 @@ class IRWTools:
             if name_key in seen_names:
                 continue
             seen_names.add(name_key)
-            record["tagged"] = _is_tagged(raw)
-            if not record["tagged"]:
+            tagged = _is_tagged(raw)
+            if not tagged:
                 n_untagged += 1
 
-            if collection is not None and not _matches_exact(
-                record.get("collections"), collection
-            ):
-                continue
-            if variable is not None and not _matches_text(
-                record.get("variables"), variable
-            ):
-                continue
-            if license is not None and not _matches_text(
-                record.get("license"), license
-            ):
-                continue
-            if (
-                longitudinal is not None
-                and _as_bool(record.get("longitudinal")) != longitudinal
-            ):
-                continue
-            if (
-                has_item_text is not None
-                and _as_bool(record.get("has_item_text")) != has_item_text
-            ):
+            if allowed is not None and name_key not in allowed:
                 continue
 
+            # The card is lean but the search is not: the query still runs over
+            # every metadata field, including the ones describe_table keeps.
             searchable = " ".join(
                 _search_text(value) for value in raw.values()
             ).casefold()
             if query_tokens and not all(token in searchable for token in query_tokens):
                 continue
+
+            card = {
+                field: record[field]
+                for field in SEARCH_CARD_FIELDS
+                if field in record
+            }
+            card["name"] = name_text
+            card["tagged"] = tagged
 
             score = 0
             if query_casefold:
@@ -899,28 +1109,11 @@ class IRWTools:
                 elif query_casefold in name_key:
                     score += 10000
                 score += sum(100 if token in name_key else 10 for token in query_tokens)
-            matches.append((score, name_key, record))
+            matches.append((score, name_key, card))
 
         matches.sort(key=lambda item: (-item[0], item[1]))
         total = len(matches)
-        page = [record for _, _, record in matches[offset : offset + limit]]
-        caveats = [
-            f"Tags are human-added and incomplete: {n_untagged} of "
-            f"{len(seen_names)} tables carry no tags at all (see `tagged` on "
-            "each record). An untagged table is not a non-matching table."
-        ]
-        if collection is not None:
-            caveats.append(
-                "Filtering on a collection restricts results to tables whose "
-                "tags or variables put them in it; untagged tables that "
-                "measure the same thing are not returned."
-            )
-        if longitudinal is not None:
-            caveats.append(
-                "`longitudinal` is derived by grepping the variable string, so "
-                "names like cov_birthdate and cov_startdate also match. Confirm "
-                "an actual `wave` or `date` column in `variables`."
-            )
+        page = [card for _, _, card in matches[offset : offset + limit]]
         return self._stamp(
             {
                 "source": SOURCE,
@@ -930,10 +1123,72 @@ class IRWTools:
                 "limit": limit,
                 "has_more": offset + len(page) < total,
                 "n_untagged_in_catalogue": n_untagged,
-                "caveats": caveats,
+                "filters_applied": selected,
+                "caveats": self._search_caveats(
+                    selected, n_untagged, len(seen_names)
+                ),
                 "warnings": state.warnings,
             }
         )
+
+    def _search_caveats(
+        self,
+        selected: Mapping[str, Any],
+        n_untagged: Optional[int],
+        n_total: Optional[int],
+    ) -> List[str]:
+        """Caveats for this search, with the package's own filter text attached.
+
+        Each applied filter contributes the description the package already
+        keeps for it, so a caveat added to FILTER_DESCRIPTIONS reaches the
+        assistant without anyone editing this file.
+        """
+        caveats: List[str] = []
+        if n_untagged is not None and n_total:
+            caveats.append(
+                f"Tags are human-added and incomplete: {n_untagged} of "
+                f"{n_total} tables carry no tags at all (see `tagged` on each "
+                "record). An untagged table is not a non-matching table, and "
+                "any tag-based filter silently restricts you to the tagged "
+                "subset."
+            )
+        else:
+            caveats.append(
+                "Tags are human-added and incomplete. An untagged table is "
+                "not a non-matching table, and any tag-based filter silently "
+                "restricts you to the tagged subset."
+            )
+        if selected:
+            caveats.append(
+                "No density filter was applied unless you asked for one; "
+                "irw.filter() defaults to density=[0.5, 1], which would have "
+                "dropped sparse tables silently."
+            )
+        for name in selected:
+            description = self._filter_description(name)
+            if description:
+                caveats.append(f"{name}: {description}")
+        caveats.append(
+            "Each record is a summary card. Call describe_table for a table's "
+            "full metadata, and get_processing_notes before recommending it."
+        )
+        return caveats
+
+    def _filter_description(self, filter_name: str) -> Optional[str]:
+        """One filter's description text, or None if it cannot be loaded."""
+        if filter_name in self._filter_descriptions:
+            return self._filter_descriptions[filter_name]
+        text: Optional[str] = None
+        try:
+            details, _ = self._call(self.backend.describe_filter, filter_name)
+            if isinstance(details, Mapping):
+                value = details.get("description")
+                if isinstance(value, str) and value.strip():
+                    text = value.strip()
+        except IRWMCPError:
+            text = None
+        self._filter_descriptions[filter_name] = text
+        return text
 
     def describe_table(self, table_name: str) -> Dict[str, Any]:
         table_name = _validate_table_name(table_name)
@@ -975,31 +1230,68 @@ class IRWTools:
         wide = _validate_bool(wide, "wide")
         dedup = _validate_bool(dedup, "dedup")
 
-        # Size guard as a pre-check, not a truncation: irw.fetch() has no row
-        # argument, so by the time rows could be counted the whole table has
-        # already been exported against the account's quota. n_responses is in
-        # the metadata table, which costs nothing to read.
+        # The page is bounded on the wire, not after the download: irw.fetch()
+        # takes max_rows and columns and hands both to Redivis's read session,
+        # so a page of a 107M-response table costs a page. Paging past the
+        # window means asking for offset+limit rows and dropping the offset --
+        # still bounded, and the only option Redivis's read API offers.
+        #
+        # dedup and wide are the exception. Each describes the whole table:
+        # dedup can only drop the duplicates it can see, and long2resp
+        # reshapes whatever rows it is handed. Capping either produces a
+        # confident, wrong-shaped answer, so those keep the catalogue
+        # pre-check instead.
         facts = self._catalogue().get(table_name.casefold())
         guard_warnings: List[str] = []
-        if facts is None:
+
+        # Column names now go to Redivis, which rejects an unknown one with a
+        # wire error the caller cannot act on. The catalogue already carries
+        # the variable list, so an obvious typo is caught here and named --
+        # for nothing, and before the request. When the catalogue has no
+        # variable list, the check is skipped rather than guessed at.
+        known_columns = (facts or {}).get("variables")
+        if columns and known_columns:
+            known = {str(column).casefold() for column in known_columns if column}
+            unknown = [
+                column for column in columns if column.casefold() not in known
+            ]
+            if unknown:
+                raise IRWMCPError(
+                    "invalid_input",
+                    f"Unknown column(s) for '{table_name}': "
+                    f"{', '.join(unknown)}. This table has: "
+                    f"{', '.join(str(c) for c in known_columns)}.",
+                )
+
+        needs_whole_table = wide or dedup
+        max_rows: Optional[int] = None if needs_whole_table else offset + limit
+        if needs_whole_table:
+            reason = "wide=true" if wide else "dedup=true"
+            if facts is None:
+                guard_warnings.append(
+                    f"'{table_name}' is not in the IRW catalogue, so its size "
+                    f"could not be checked before downloading it in full for "
+                    f"{reason}."
+                )
+            elif facts.get("n_responses") is None:
+                guard_warnings.append(
+                    f"The catalogue has no response count for '{table_name}', "
+                    f"so its size could not be checked before downloading it "
+                    f"in full for {reason}."
+                )
+            elif facts["n_responses"] > FETCH_MAX_RESPONSES:
+                raise IRWMCPError(
+                    "table_too_large",
+                    f"Table '{table_name}' has {facts['n_responses']:,} "
+                    f"responses, above the {FETCH_MAX_RESPONSES:,} guard, and "
+                    f"{reason} describes the whole table so it cannot be "
+                    "bounded to a page. Retry with wide=false and dedup=false "
+                    "for a bounded sample of the raw rows, or use "
+                    "describe_table for its statistics.",
+                )
             guard_warnings.append(
-                f"'{table_name}' is not in the IRW catalogue, so its size could "
-                "not be checked before downloading."
-            )
-        elif facts.get("n_responses") is None:
-            guard_warnings.append(
-                f"The catalogue has no response count for '{table_name}', so its "
-                "size could not be checked before downloading."
-            )
-        elif facts["n_responses"] > FETCH_MAX_RESPONSES:
-            raise IRWMCPError(
-                "table_too_large",
-                f"Table '{table_name}' has {facts['n_responses']:,} responses, "
-                f"above the {FETCH_MAX_RESPONSES:,} guard. Any fetch downloads "
-                "the whole table against the account's 30-day Redivis export "
-                "quota, so this server refuses it. Use describe_table for its "
-                "statistics, or fetch it deliberately with the irw package "
-                "outside this server.",
+                f"{reason} is computed over the whole table, so this call "
+                "downloaded all of it rather than one page."
             )
 
         frame, package_warnings = self._call(
@@ -1007,6 +1299,8 @@ class IRWTools:
             table_name,
             wide=wide,
             dedup=dedup,
+            max_rows=max_rows,
+            columns=columns,
         )
         if frame is None:
             raise IRWMCPError("not_found", f"Table '{table_name}' was not found.")
@@ -1030,6 +1324,27 @@ class IRWTools:
             columns=columns,
             initial_warnings=guard_warnings + package_warnings,
         )
+        if max_rows is not None:
+            # `total_rows` from _page_dataframe counts the rows that arrived,
+            # which under a wire-level cap is the cap. Reporting that as the
+            # table's size would be a plain lie, and `has_more: false` at the
+            # end of a full window would be a worse one.
+            fetched = int(len(frame))
+            payload["total_rows"] = None
+            payload["has_more"] = fetched >= max_rows
+            payload["truncated"] = payload["has_more"]
+            estimate = (facts or {}).get("n_responses")
+            payload["total_rows_estimate"] = estimate
+            payload["total_rows_note"] = (
+                "Only the requested window was downloaded, so the table's row "
+                "count is not known from this call. total_rows_estimate is the "
+                "catalogue's response count"
+                + (
+                    "; it counts all columns' responses, not the rows returned here."
+                    if columns
+                    else " for the whole table."
+                )
+            )
         payload.update(
             {"source": SOURCE, "table": table_name, "wide": wide, "dedup": dedup}
         )
@@ -1196,6 +1511,13 @@ class IRWTools:
                 "another name or outside the repository; nothing here says how "
                 "its id, items or covariates were built."
             )
+            if getattr(self.source, "scripts_truncated", False):
+                state.add(
+                    "GitHub truncated the repository listing, so the script "
+                    "may exist and simply not be in the part that was "
+                    "returned. Treat this as 'not looked up', not as 'not "
+                    f"there': check {IRW_REPO_BLOB_URL}data/ directly."
+                )
         elif match == "prefix":
             state.add(
                 "Matched by name prefix, not exactly: the script may produce "
@@ -1239,6 +1561,50 @@ SERVER_INSTRUCTIONS = (
 )
 
 
+def _search_tables_doc(tools: "IRWTools") -> str:
+    """Assemble search_tables' description from the package's filter list."""
+    header = (
+        "Search IRW tables by free text and by the irw package's own filters.\n"
+        "\n"
+        "`query` matches every metadata field, including ones the result card "
+        "omits. `filters` is an object passed straight to irw.filter(), so the "
+        "filter names and semantics are the package's -- for example "
+        '{\"construct_type\": \"Cognitive\", \"n_items\": [10, 50]}. Numeric '
+        "filters take a number for an exact match or [min, max] for a range "
+        "(None for no bound); tag filters take a string or a list of strings, "
+        "matched with OR.\n"
+        "\n"
+        "Results are a summary card each, paginated (default 20, maximum 100); "
+        "call describe_table for a table's full metadata. Unlike irw.filter(), "
+        "no default density filter is applied, so sparse tables are not "
+        "silently dropped.\n"
+        "\n"
+        "Read `caveats` before trusting a filtered result. Tags are human-added "
+        "and incomplete, so an untagged table is NOT a non-matching table and "
+        "every tag-based filter restricts you to the tagged subset; each record "
+        "carries `tagged` and the response carries `n_untagged_in_catalogue`.\n"
+        "\n"
+        "Matching is deterministic and case-insensitive. Two collection "
+        "meanings that are easy to get wrong: `treat` means an experimental "
+        "assignment is recorded, not merely that a treatment occurred, and "
+        "`longitudinal` is derived by grepping the variable string, so "
+        "cov_birthdate and cov_startdate match too -- confirm a real `wave` "
+        "or `date` column before treating a table as a panel."
+    )
+    try:
+        names = tools.filter_names()
+    except Exception:  # a catalogue that will not load must not stop startup
+        return header + (
+            "\n\nCall describe_filter to list the available filters and the "
+            "values each one takes."
+        )
+    lines = [header, "", "Available filters (describe_filter gives the values each takes):"]
+    for name in names:
+        description = tools._filter_description(name)
+        lines.append(f"- {name}: {description}" if description else f"- {name}")
+    return "\n".join(lines)
+
+
 def create_server(
     backend: Optional[IRWBackend] = None,
     source: Optional[GitHubSource] = None,
@@ -1271,41 +1637,29 @@ def create_server(
     @server.tool(name="search_tables", annotations=read_only, structured_output=True)
     def search_tables(
         query: str = "",
-        collection: Optional[str] = None,
-        variable: Optional[str] = None,
-        license: Optional[str] = None,
-        longitudinal: Optional[bool] = None,
-        has_item_text: Optional[bool] = None,
+        filters: Optional[Dict[str, Any]] = None,
         limit: int = SEARCH_DEFAULT_LIMIT,
         offset: int = 0,
     ) -> Dict[str, Any]:
-        """Search IRW table names and metadata; deterministic and case-insensitive.
+        return tools.search_tables(query, filters, limit, offset)
 
-        Results are paginated with a default limit of 20 and a maximum of 100.
-        Filters: collection, variable, license, longitudinal, has_item_text.
-        Read `caveats` before trusting a filtered result:
-        - Tags are human-added and incomplete (thinner among recent tables). An
-          untagged table is NOT a non-matching table; each record carries
-          `tagged`, and collection or tag filters silently restrict you to the
-          tagged subset.
-        - `longitudinal` is derived by grepping the variable string, so
-          cov_birthdate and cov_startdate match too; confirm a real `wave` or
-          `date` column in `variables`.
-        - `treat` (the rct collection) means an experimental assignment is
-          recorded, not merely that a treatment occurred.
-        - Unlike irw.filter(), no default density filter is applied, so sparse
-          tables appear; check `density` before per-person conclusions.
+    # The description is built from the package's own filter list rather than
+    # written here, so a filter added to irw.filter() appears in this tool
+    # without anyone remembering to edit this file. It is built once, at
+    # startup; if the catalogue cannot be reached the tool still registers
+    # with a description that says to call describe_filter.
+    search_tables.__doc__ = _search_tables_doc(tools)
+
+    @server.tool(name="describe_filter", annotations=read_only, structured_output=True)
+    def describe_filter(filter_name: str) -> Dict[str, Any]:
+        """Explain one search filter and list the values it actually takes.
+
+        Call this before guessing a filter value: the tag vocabularies are
+        closed sets with specific spellings ("Affective/mental health", not
+        "mental health"), and a value that matches nothing returns an empty
+        result that looks exactly like an absence of data.
         """
-        return tools.search_tables(
-            query,
-            collection,
-            variable,
-            license,
-            longitudinal,
-            has_item_text,
-            limit,
-            offset,
-        )
+        return tools.describe_filter(filter_name)
 
     @server.tool(name="describe_table", annotations=read_only, structured_output=True)
     def describe_table(table_name: str) -> Dict[str, Any]:
@@ -1323,16 +1677,25 @@ def create_server(
     ) -> Dict[str, Any]:
         """Fetch a bounded page of rows from one IRW table.
 
-        The default page is 100 rows and the maximum is 1,000; use offset for
-        later pages and columns to shrink the response. Tables above 1,000,000
-        responses are refused before any download (error table_too_large):
-        irw.fetch() has no row argument, so a fetch exports the whole table
-        against the account's 30-day Redivis export quota, and paging happens
-        locally afterwards. Response values keep the source's coding: higher
-        resp is consistent within an item, but reverse-scored items are NOT
-        recoded, so direction may vary across items. Duplicate id-item pairs
-        can be real data (trials, waves, raters); they are kept unless
-        dedup=true.
+        The default page is 100 rows and the maximum is 1,000. The window is
+        bounded on the wire, so a page of a 100M-response table costs a page;
+        `columns` narrows it further and is worth passing. Rows come back
+        columnar: `columns` names the fields and each entry of `rows` is a
+        list of values in that order.
+
+        Because only the window is downloaded, `total_rows` is null and
+        `has_more` says whether the window came back full;
+        `total_rows_estimate` carries the catalogue's response count.
+
+        wide=true and dedup=true are the exception. Both describe the whole
+        table, so they cannot be bounded to a page: the call downloads the
+        table, warns that it did, and is refused above 1,000,000 responses
+        (error table_too_large).
+
+        Response values keep the source's coding: higher resp is consistent
+        within an item, but reverse-scored items are NOT recoded, so direction
+        may vary across items. Duplicate id-item pairs can be real data
+        (trials, waves, raters); they are kept unless dedup=true.
         """
         return tools.fetch_table(table_name, limit, offset, columns, wide, dedup)
 
@@ -1344,11 +1707,14 @@ def create_server(
     ) -> Dict[str, Any]:
         """Return a bounded page of item-level text with its rights information.
 
-        `rights` carries the response-data licence, the instrument-rights rule
-        and the table's public notes from the item-text issues page (withdrawn
-        wording, machine translations, known mismatches). The deposit licence
-        is not an instrument licence: never reproduce a scale on its strength.
-        Text is reconstructed with partial review; verify against the source.
+        `rights` carries the response-data licence (IRW's Derived License,
+        not the source deposit's Original License, which is not in the
+        metadata this server reads and is reported as null), the
+        instrument-rights rule, and the table's public notes from the
+        item-text issues page (withdrawn wording, machine translations, known
+        mismatches). The deposit licence is not an instrument licence: never
+        reproduce a scale on its strength. Text is reconstructed with partial
+        review; verify against the source.
         """
         return tools.get_itemtext(table_name, limit, offset)
 

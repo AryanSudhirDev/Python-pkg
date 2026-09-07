@@ -92,7 +92,7 @@ After releasing or sharing the update, ask users to **restart their Python sessi
 The optional MCP server lives in `src/irw/mcp.py` and is deliberately separate
 from the core API. Install it with `pip install "irw[mcp]"` on Python 3.10 or
 newer. The server uses the official MCP Python SDK over stdio and registers the
-seven read-only tools documented in the package README. Every response is
+eight read-only tools documented in the package README. Every response is
 stamped with `irw_version` / `irw_released_at` from `current_version()`; a
 manifest failure degrades to an unpinned result with a warning, never an error.
 
@@ -107,10 +107,24 @@ Guards happen before the call that would cost something. Missing Redivis
 credentials are a structured `authentication_required` error, not a hang: the
 SDK's fallback is an interactive browser login that can never complete inside
 a stdio server, so `PackageBackend.ensure_ready` checks for `REDIVIS_API_TOKEN`
-or `~/.redivis/python_credentials` first. The `fetch_table` size guard reads
-`n_responses` from the catalogue and refuses above `FETCH_MAX_RESPONSES`
-(1,000,000, the same number as `llms.txt` section 3) because `irw.fetch()` has
-no row argument and a post-hoc cap would have spent the quota already.
+or `~/.redivis/python_credentials` first.
+
+`fetch_table` bounds its window on the wire: it passes `max_rows` and
+`columns` to `irw.fetch()`, which forwards both to Redivis's read session, so
+the rows outside the page are never sent. The `FETCH_MAX_RESPONSES` guard
+(1,000,000, the same number as `llms.txt` section 3) survives only for
+`wide=true` and `dedup=true`, which describe the whole table and so cannot be
+expressed as a page; for those it reads `n_responses` from the catalogue and
+refuses before downloading.
+
+**Do not reimplement the package inside the adapter.** `search_tables` takes a
+`filters` object, validates the names against `irw.get_filters()` and passes
+it to `irw.filter()`; the tool description and the per-filter caveats are
+generated from `describe_filter()`. The first version of the server filtered
+over `list_tables()` by hand, accepted five filters where the package had
+nineteen, and dropped the coverage caveats `FILTER_DESCRIPTIONS` already
+carried -- which is how "no match" starts reading as "no data". If a filter is
+missing, add it to `irw.filter()` (see `has_item_text`), not to the adapter.
 
 Keep stdout clean: MCP protocol messages use stdout, while diagnostics belong
 on stderr. The adapter captures human-readable output and warnings emitted by

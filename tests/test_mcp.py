@@ -16,6 +16,8 @@ from irw.mcp import GitHubSource, IRWMCPError, IRWTools, create_server
 
 class FakeBackend:
     def __init__(self):
+        self.fetch_calls = []
+        self.filter_calls = []
         self.tables = pd.DataFrame(
             {
                 "name": ["alpha_depression", "beta_math", "gamma_depression"],
@@ -72,8 +74,65 @@ class FakeBackend:
     def describe_table(self, table_name):
         return self.info.get(table_name)
 
-    def fetch_table(self, table_name, *, wide, dedup):
-        return self.frames.get(table_name)
+    def fetch_table(
+        self, table_name, *, wide, dedup, max_rows=None, columns=None
+    ):
+        self.fetch_calls.append(
+            {
+                "table": table_name,
+                "wide": wide,
+                "dedup": dedup,
+                "max_rows": max_rows,
+                "columns": columns,
+            }
+        )
+        frame = self.frames.get(table_name)
+        if frame is None:
+            return None
+        # Stand in for Redivis: the wire honours the bounds, so a test that
+        # asserts on the returned page cannot pass by accident when the
+        # adapter drops back to slicing a full download.
+        if columns is not None:
+            frame = frame.loc[:, list(columns)]
+        if max_rows is not None:
+            frame = frame.iloc[:max_rows]
+        return frame.copy()
+
+    def filter_tables(self, **filters):
+        self.filter_calls.append(dict(filters))
+        frame = self.tables
+        if "collection" in filters:
+            wanted = filters["collection"]
+            wanted = [wanted] if isinstance(wanted, str) else list(wanted)
+            keep = frame["collections"].map(
+                lambda cs: any(c in (cs or []) for c in wanted)
+            )
+            frame = frame[keep]
+        if "longitudinal" in filters:
+            frame = frame[frame["longitudinal"] == filters["longitudinal"]]
+        if "license" in filters:
+            frame = frame[frame["license"] == filters["license"]]
+        if "construct_type" in filters:
+            frame = frame[frame["construct_type"] == filters["construct_type"]]
+        return pd.Series(frame["name"].tolist(), name="name", dtype=str)
+
+    def filter_names(self):
+        return [
+            "n_responses",
+            "n_items",
+            "density",
+            "var",
+            "construct_type",
+            "longitudinal",
+            "license",
+            "collection",
+        ]
+
+    def describe_filter(self, filter_name):
+        return {
+            "description": f"How {filter_name} works.",
+            "available_values": ["a", "b"],
+        }
 
     def itemtext(self, table_name):
         return self.items.get(table_name, "unavailable")
@@ -170,12 +229,66 @@ def test_search_is_deterministic_and_bounded(tools):
     assert result["has_more"] is False
 
 
-def test_search_filters_collections_variables_and_longitudinal(tools):
-    result = tools.search_tables(collection="depression", variable="cov_age")
+def test_search_delegates_filtering_to_the_package(tools):
+    """The filter names and semantics must be irw.filter()'s, not ours."""
+    result = tools.search_tables(filters={"collection": "depression"})
+    assert [row["name"] for row in result["tables"]] == [
+        "alpha_depression",
+        "gamma_depression",
+    ]
+    assert tools.backend.filter_calls[-1]["collection"] == "depression"
+    assert result["filters_applied"] == {"collection": "depression"}
+
+    result = tools.search_tables(filters={"longitudinal": True})
+    assert [row["name"] for row in result["tables"]] == ["gamma_depression"]
+
+
+def test_search_accepts_every_filter_the_package_offers(tools):
+    """A filter list kept by hand is a list that goes stale."""
+    for name in tools.backend.filter_names():
+        tools.search_tables(filters={name: "x"})
+
+
+def test_search_rejects_a_filter_the_package_does_not_have(tools):
+    with pytest.raises(IRWMCPError) as error:
+        tools.search_tables(filters={"has_item_text": True})
+    assert error.value.code == "invalid_input"
+    # The message has to name the real ones, or the caller just guesses again.
+    assert "construct_type" in error.value.message
+
+
+def test_search_opts_out_of_the_default_density_filter(tools):
+    """irw.filter() defaults density to [0.5, 1] and drops sparse tables with
+    only a warning. Nobody asked for that by asking about a construct."""
+    tools.search_tables(filters={"construct_type": "Affective"})
+    assert tools.backend.filter_calls[-1]["density"] is None
+
+
+def test_search_keeps_a_density_the_caller_actually_asked_for(tools):
+    tools.search_tables(filters={"density": [0.9, 1]})
+    assert tools.backend.filter_calls[-1]["density"] == [0.9, 1]
+
+
+def test_search_cards_are_lean_and_describe_table_still_has_everything(tools):
+    """The full record is ~220 tokens; twenty of them is most of a search."""
+    card = tools.search_tables()["tables"][0]
+    assert "variables" not in card and "description" not in card
+    assert card["name"] and "n_responses" in card and card["tagged"] is True
+
+
+def test_search_query_still_matches_fields_the_card_omits(tools):
+    """Leaning out the card must not lean out the search."""
+    result = tools.search_tables(query="cov_age")
     assert [row["name"] for row in result["tables"]] == ["alpha_depression"]
 
-    result = tools.search_tables(longitudinal=True, has_item_text=True)
-    assert [row["name"] for row in result["tables"]] == ["gamma_depression"]
+
+def test_describe_filter_reports_the_packages_own_values(tools):
+    result = tools.describe_filter("construct_type")
+    assert result["description"] == "How construct_type works."
+    assert result["available_values"] == ["a", "b"]
+    with pytest.raises(IRWMCPError) as error:
+        tools.describe_filter("nonsense")
+    assert error.value.code == "invalid_input"
 
 
 def test_search_paginates_and_sorts_without_query(tools):
@@ -195,22 +308,48 @@ def test_describe_suppresses_package_stdout(tools, capsys):
 
 def test_fetch_is_bounded_and_json_safe(tools):
     result = tools.fetch_table("alpha_depression", limit=2, offset=1)
-    assert result["total_rows"] == 3
     assert result["returned"] == 2
-    assert result["has_more"] is False
-    assert result["rows"][0]["id"] == 2
-    assert result["rows"][0]["resp"] is None
-    assert result["rows"][0]["when"] == "2026-01-02T00:00:00"
+    assert [column["name"] for column in result["columns"]] == [
+        "id",
+        "item",
+        "resp",
+        "when",
+    ]
+    # Columnar: values in column order, not a dict per row.
+    assert result["rows"][0][0] == 2
+    assert result["rows"][0][2] is None
+    assert result["rows"][0][3] == "2026-01-02T00:00:00"
     json.dumps(result, allow_nan=False)
 
 
-def test_fetch_selects_columns_and_rejects_unknown_columns(tools):
+def test_fetch_bounds_the_window_on_the_wire_not_after_the_download(tools):
+    """The assertion that matters is on what was requested. A row-count check
+    passes just as well against a full download that was sliced afterwards."""
+    tools.fetch_table("alpha_depression", limit=2, offset=1)
+    assert tools.backend.fetch_calls[-1]["max_rows"] == 3
+
+
+def test_fetch_does_not_claim_a_row_count_it_did_not_download(tools):
+    result = tools.fetch_table("alpha_depression", limit=1)
+    assert result["total_rows"] is None
+    assert result["has_more"] is True
+    assert result["total_rows_estimate"] == 100
+    assert "not known from this call" in result["total_rows_note"]
+
+
+def test_fetch_pushes_columns_to_the_wire(tools):
     result = tools.fetch_table("alpha_depression", columns=["id", "resp"], limit=1)
+    assert tools.backend.fetch_calls[-1]["columns"] == ["id", "resp"]
     assert [column["name"] for column in result["columns"]] == ["id", "resp"]
-    assert set(result["rows"][0]) == {"id", "resp"}
+    assert len(result["rows"][0]) == 2
+
+
+def test_fetch_names_an_unknown_column_instead_of_sending_it(tools):
     with pytest.raises(IRWMCPError) as error:
         tools.fetch_table("alpha_depression", columns=["missing"])
     assert error.value.code == "invalid_input"
+    assert "cov_age" in error.value.message
+    assert tools.backend.fetch_calls == []
 
 
 @pytest.mark.parametrize(
@@ -389,31 +528,51 @@ def test_search_marks_untagged_tables_and_says_so(tools):
     assert by_name["beta_math"]["tagged"] is False
     assert result["n_untagged_in_catalogue"] == 2
     assert any("untagged table is not a non-matching" in c for c in result["caveats"])
-    filtered = tools.search_tables(longitudinal=True)
-    assert any("cov_birthdate" in c for c in filtered["caveats"])
+    filtered = tools.search_tables(filters={"longitudinal": True})
+    # The caveat text is the package's own, so it cannot drift from it.
+    assert any("How longitudinal works." in c for c in filtered["caveats"])
 
 
-def test_fetch_refuses_a_table_over_the_size_guard_before_downloading():
-    backend = FakeBackend()
-    calls = []
-    original = backend.fetch_table
-
-    def spy(table_name, *, wide, dedup):
-        calls.append(table_name)
-        return original(table_name, wide=wide, dedup=dedup)
-
-    backend.fetch_table = spy
-    with pytest.raises(IRWMCPError) as error:
-        IRWTools(backend, FakeSource()).fetch_table("huge_assessment")
-    assert error.value.code == "table_too_large"
-    assert "50,000,000" in error.value.message
-    assert calls == [], "the guard must fire before any download"
+def test_a_huge_table_can_still_be_sampled_a_page_at_a_time(tools):
+    """The old guard refused these outright. A bounded page of a 50M-response
+    table costs a page, and refusing it is the answer to a problem the wire
+    limit already solved."""
+    tools.backend.frames["huge_assessment"] = tools.backend.frames[
+        "alpha_depression"
+    ]
+    result = tools.fetch_table("huge_assessment", limit=2)
+    assert result["returned"] == 2
+    assert tools.backend.fetch_calls[-1]["max_rows"] == 2
 
 
-def test_fetch_of_an_uncatalogued_table_warns_but_proceeds(tools):
+def test_the_guard_still_fires_where_the_window_cannot_bound_the_work(tools):
+    """wide and dedup describe the whole table, so they cannot be paged."""
+    for kwargs in ({"wide": True}, {"dedup": True}):
+        with pytest.raises(IRWMCPError) as error:
+            tools.fetch_table("huge_assessment", **kwargs)
+        assert error.value.code == "table_too_large"
+        assert "50,000,000" in error.value.message
+    assert tools.backend.fetch_calls == [], "the guard must precede any download"
+
+
+def test_dedup_on_a_small_table_says_it_downloaded_the_whole_thing(tools):
+    result = tools.fetch_table("alpha_depression", limit=1, dedup=True)
+    assert tools.backend.fetch_calls[-1]["max_rows"] is None
+    assert any("whole table" in w for w in result["warnings"])
+
+
+def test_fetch_of_an_uncatalogued_table_proceeds_bounded(tools):
+    """No catalogue entry means no size to check -- but the window still
+    bounds the download, so there is nothing to warn about."""
     tools.backend.frames["off_catalogue"] = tools.backend.frames["alpha_depression"]
     result = tools.fetch_table("off_catalogue", limit=1)
     assert result["returned"] == 1
+    assert tools.backend.fetch_calls[-1]["max_rows"] == 1
+
+
+def test_an_uncatalogued_table_warns_when_it_must_be_downloaded_whole(tools):
+    tools.backend.frames["off_catalogue"] = tools.backend.frames["alpha_depression"]
+    result = tools.fetch_table("off_catalogue", limit=1, dedup=True)
     assert any("not in the IRW catalogue" in w for w in result["warnings"])
 
 
@@ -424,6 +583,10 @@ def test_itemtext_carries_rights_licence_and_public_notes(tools):
     assert "not an instrument licence" in rights["instrument_rights"] or "does not extend to the instrument" in rights["instrument_rights"]
     assert len(rights["public_notes"]) == 1
     assert "machine translation" in rights["public_notes"][0]
+    # The derived licence must not be passed off as the source deposit's.
+    assert rights["response_data_license_field"] == "Derived License"
+    assert rights["original_license"] is None
+    assert "reported as null" in rights["original_license_note"]
     assert any("public item-text note" in w for w in result["warnings"])
 
 
@@ -503,3 +666,65 @@ def test_script_header_stops_at_code_and_handles_docstrings():
     assert header.startswith("x <- 1")
     header, truncated = _script_header("\n".join("# line" for _ in range(500)))
     assert truncated is True
+
+
+def test_a_truncated_github_listing_is_not_reported_as_a_missing_script():
+    """GitHub caps a recursive tree and says so only in `truncated`. A capped
+    listing looks exactly like a repo with fewer scripts in it, which turns
+    "no notes for this table" from an error into a false statement."""
+    truncated = json.loads(TREE_JSON)
+    truncated["truncated"] = True
+    truncated["tree"] = [
+        entry for entry in truncated["tree"] if "alpha_depression" not in entry["path"]
+    ]
+
+    class _Truncated(FakeSource):
+        def _fetch_text(self, url):
+            if url.endswith("trees/main?recursive=1"):
+                return json.dumps(truncated)
+            return super()._fetch_text(url)
+
+    tools = IRWTools(FakeBackend(), _Truncated())
+    result = tools.get_processing_notes("alpha_depression")
+    assert result["match"] == "none"
+    assert any("truncated the repository listing" in w for w in result["warnings"])
+
+
+def test_a_complete_listing_does_not_claim_it_was_truncated(tools):
+    result = tools.get_processing_notes("not_a_table_anywhere")
+    assert result["match"] == "none"
+    assert not any("truncated" in w for w in result["warnings"])
+
+
+def test_the_search_tool_description_is_generated_from_the_package():
+    """A hand-written filter list in the tool text is a list that goes stale
+    the first time irw.filter() gains an argument."""
+    from irw.mcp import _search_tables_doc
+
+    backend = FakeBackend()
+    doc = _search_tables_doc(IRWTools(backend, FakeSource()))
+    for name in backend.filter_names():
+        assert f"- {name}: How {name} works." in doc
+
+
+def test_the_description_still_builds_when_the_catalogue_is_unreachable():
+    """A server that will not start is worse than one with a terse description."""
+    from irw.mcp import _search_tables_doc
+
+    class _Broken(FakeBackend):
+        def filter_names(self):
+            raise ConnectionError("offline")
+
+    doc = _search_tables_doc(IRWTools(_Broken(), FakeSource()))
+    assert "describe_filter" in doc
+
+
+def test_filter_results_that_are_not_a_series_still_resolve():
+    """irw.filter() returns a Series today; _name_set must not depend on that."""
+    from irw.mcp import _name_set
+
+    assert _name_set(pd.Series(["A", "b"])) == {"a", "b"}
+    assert _name_set(["A", None]) == {"a"}
+    assert _name_set(np.array(["A"])) == {"a"}
+    assert _name_set(pd.DataFrame({"name": ["A"]})) == {"a"}
+    assert _name_set(None) == set()
