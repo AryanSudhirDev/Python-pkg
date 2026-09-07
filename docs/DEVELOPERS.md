@@ -157,3 +157,39 @@ limitation to work around -- during that window the configs genuinely disagree.
 
 The full cross-repo runbook, including the Redivis and metadata steps that have
 no Python side, is `Rpkg/inst/developer/warehouses.md`.
+
+## Cutting a release
+
+The package is on PyPI as [`irw`](https://pypi.org/project/irw/). Users install
+`pip install irw`; `pip install git+https://...` still works and is now the
+development install.
+
+1. **Bump both version literals in one PR** — `pyproject.toml` `[project]
+   version` and `VERSION` in `src/irw/config.py`.
+   `tests/test_version_string.py` fails if they disagree, so this is one commit,
+   not two.
+2. Merge it, and let `tests.yml` go green on `main`.
+3. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+The tag fires `.github/workflows/release.yml`, which builds, runs
+`twine check`, publishes to PyPI, and creates the GitHub release with the
+artifacts attached. There is no other step.
+
+**Never move a tag onto an unbumped commit.** A fix that lands on `main` without
+a version bump does not reach anyone: pip resolves the version, sees it already
+installed and skips even under `--upgrade`. That is not hypothetical — it left
+Rpkg v1.1.2 broken against `irw_meta` v21.0 for three days (`Rpkg#153`).
+`.github/scripts/check_release_version.py` runs before the build and refuses a
+tag that disagrees with either literal; run it locally with the tag you intend
+to push if you want the check early.
+
+**PyPI version numbers are burn-once.** A number cannot be re-uploaded, even
+after the release is deleted. To rehearse without spending one, run `release`
+via `workflow_dispatch` — that does everything except the upload.
+
+**Authentication is Trusted Publishing (OIDC), not a token.** There is no
+credential in this repository. PyPI is configured to trust
+`itemresponsewarehouse/Python-pkg`, workflow `release.yml`, environment `pypi`
+— so renaming the workflow file or the environment breaks publishing until the
+publisher entry is updated at
+<https://pypi.org/manage/project/irw/settings/publishing/>.
