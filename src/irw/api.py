@@ -19,6 +19,7 @@ Usage:
 """
 
 from __future__ import annotations
+import warnings
 import datetime
 from typing import Optional, Union, Dict, List, Literal
 import pandas as pd
@@ -155,7 +156,9 @@ def fetch(
     source: str = "main", 
     *, 
     dedup: bool = False,
-    wide: bool = False
+    wide: bool = False,
+    max_rows: Optional[int] = None,
+    columns: Optional[List[str]] = None,
 ) -> Union[pd.DataFrame, Dict[str, Optional[pd.DataFrame]]]:
     """
     Fetch one or more IRW tables.
@@ -171,6 +174,14 @@ def fetch(
     wide : bool, default False
         If True, automatically convert to wide-format response matrix using long2resp().
         Only works for single table fetch. For multiple tables, use long2resp() separately.
+    max_rows : int, optional
+        Return at most this many rows per table. The cap is pushed to Redivis,
+        so only these rows are exported and charged against the account's
+        export quota -- the reason to prefer it over slicing the result.
+        These are the table's first ``max_rows`` rows in storage order, not a
+        random sample, so they are not representative of the table.
+    columns : list of str, optional
+        Return only these columns. Also pushed to Redivis.
         
     Returns
     -------
@@ -179,7 +190,21 @@ def fetch(
         If wide=True, returns wide-format response matrix instead of long format.
     """
     datasets = _get_datasets(source)
-    result = _fetch(datasets, table_name, dedup=dedup)
+    if wide and max_rows is not None:
+        # long2resp infers the response matrix from the rows it is given, so a
+        # capped fetch yields a matrix of whoever happened to be in the first
+        # max_rows rows -- usually a handful of ids with full response vectors
+        # and nothing else. Useful as a shape check, misleading as data.
+        warnings.warn(
+            f"wide=True with max_rows={max_rows} reshapes only the first "
+            f"{max_rows} rows, so the response matrix covers whichever ids "
+            "appear in them rather than the table's respondents.",
+            UserWarning,
+            stacklevel=2,
+        )
+    result = _fetch(
+        datasets, table_name, dedup=dedup, max_rows=max_rows, columns=columns
+    )
     
     # Handle single DataFrame result
     if isinstance(result, pd.DataFrame):
