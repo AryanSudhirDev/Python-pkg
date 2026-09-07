@@ -4,17 +4,27 @@ Two separate literals used to disagree -- `irw.__version__` said 0.0.1 while
 `irw.config.VERSION` and pyproject said 0.0.2 -- so a user could not tell which
 build they had.
 
-That matters more than tidiness. The briefing at itemresponsewarehouse.org
-installs the package with:
+That matters more than tidiness, and it did not stop mattering when the package
+reached PyPI on 2026-09-07. Two reasons it still bites:
 
-    pip install "git+https://github.com/itemresponsewarehouse/Python-pkg.git"
+1. The development install is still
 
-pip re-clones, resolves the version, sees that version already installed and
-SKIPS the install -- even with --upgrade. So when a fix lands without a version
-bump, everyone who installed earlier silently keeps the broken code. That is
-exactly what happened with the metadata reference-id fix (#14): `filter()` had
-been returning the entire catalogue, and re-running the documented install line
-would not have replaced it.
+       pip install "git+https://github.com/itemresponsewarehouse/Python-pkg.git"
+
+   and pip re-clones, resolves the version, sees that version already installed
+   and SKIPS -- even with --upgrade. So a fix that lands without a version bump
+   leaves everyone who installed earlier on the broken code. That is exactly what
+   happened with the metadata reference-id fix (#14): `filter()` had been
+   returning the entire catalogue, and re-running the documented install line
+   would not have replaced it.
+
+2. PyPI resolves by the pyproject version too, and a version number can never be
+   re-uploaded once used. A release cut against disagreeing literals cannot be
+   corrected in place; it costs a whole version number.
+
+`.github/scripts/check_release_version.py` enforces the same agreement at
+release time, and adds the tag to it. This test is the half that runs on every
+PR.
 """
 
 import pathlib
