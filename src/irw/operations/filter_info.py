@@ -3,7 +3,14 @@
 from typing import List, Dict, Any, Optional
 import pandas as pd
 import re
-from ..utils.redivis.table_metadata import get_metadata_table, get_tags_table, get_biblio_table
+from ..utils.redivis.table_metadata import (
+    get_metadata_table,
+    get_tags_table,
+    get_biblio_table,
+    get_collections_table,
+    get_collection_members_table,
+)
+from ..utils.redivis.item_text import _list_itemtext_tables
 from ..operations.list_tables import _build_base_table_list
 from ..operations.filter import _split_tags
 
@@ -115,6 +122,13 @@ def describe_filter(datasets: List, filter_name: str) -> Optional[Dict[str, Any]
     # Numeric filters - only need stats/metadata table
     numeric_filters = [
         'n_responses',
+        # n_categories lives in the metadata table beside the other counts.
+        # It used to have its own branch below that looked for it in the tags
+        # table, which has never carried it, so describe_filter('n_categories')
+        # returned None for a filter that filter() accepts -- the same "the
+        # list is a lie" failure the drift test in tests/test_filter_info.py
+        # guards against, one layer down.
+        'n_categories',
         'n_participants',
         'n_items',
         'responses_per_participant',
@@ -135,34 +149,6 @@ def describe_filter(datasets: List, filter_name: str) -> Optional[Dict[str, Any]
         if filter_name not in merged.columns:
             return None
         series = merged[filter_name].dropna()
-        if series.empty:
-            return None
-        result['values'] = {
-            'min': float(series.min()),
-            'max': float(series.max()),
-            'mean': float(series.mean()),
-            'median': float(series.median()),
-            'std': float(series.std()),
-            'count': len(series),
-            'non_null_count': len(series),
-            'null_count': len(merged) - len(series)
-        }
-        return result
-    
-    # n_categories is in tags table, not metadata table
-    if filter_name == 'n_categories':
-        tags_df = get_tags_table()
-        if tags_df.empty:
-            return None
-        
-        # Merge with base
-        tags_df['name_lower'] = tags_df['table'].str.lower()
-        base['name_lower'] = base['name'].str.lower()
-        merged = base.merge(tags_df, left_on='name_lower', right_on='name_lower', how='left')
-        
-        if 'n_categories' not in merged.columns:
-            return None
-        series = merged['n_categories'].dropna()
         if series.empty:
             return None
         result['values'] = {
@@ -311,5 +297,45 @@ def describe_filter(datasets: List, filter_name: str) -> Optional[Dict[str, Any]
             False: int(long_counts.get(False, 0))
         }
         return result
-    
+
+    if filter_name == 'has_item_text':
+        # Computed, not stored: a table has item text when its name is in one
+        # of the irw_text shards. Same source list_tables() uses for the
+        # column filter() reads, so these counts are the ones filter() sees.
+        try:
+            with_text = _list_itemtext_tables()
+        except Exception:
+            return None
+        names = base['name'].dropna().astype(str).str.lower()
+        n_true = int(names.isin(with_text).sum())
+        result['values'] = {True: n_true, False: int(len(names) - n_true)}
+        return result
+
+    if filter_name == 'collection':
+        # The registry names every collection, including ones whose rule
+        # matched nothing that is live today; the members table gives the live
+        # count. Reported the same way collections() does, so a name copied
+        # from here into filter(collection=...) is one filter() knows.
+        registry = get_collections_table()
+        if registry.empty or 'collection' not in registry.columns:
+            return None
+        try:
+            members = get_collection_members_table()
+        except Exception:
+            members = pd.DataFrame(columns=['table', 'collection'])
+        live: Dict[str, int] = {}
+        if not members.empty and {'table', 'collection'} <= set(members.columns):
+            live = members.groupby('collection')['table'].nunique().to_dict()
+        rows = [
+            (str(name), int(live.get(name, 0)))
+            for name in registry['collection'].dropna().drop_duplicates()
+        ]
+        rows.sort(key=lambda row: (-row[1], row[0]))
+        result['values'] = pd.Series(
+            [count for _, count in rows],
+            index=[name for name, _ in rows],
+            name='collection',
+        )
+        return result
+
     return None
