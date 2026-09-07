@@ -18,6 +18,7 @@ class FakeBackend:
     def __init__(self):
         self.fetch_calls = []
         self.filter_calls = []
+        self.describe_filter_calls = []
         self.tables = pd.DataFrame(
             {
                 "name": ["alpha_depression", "beta_math", "gamma_depression"],
@@ -129,10 +130,14 @@ class FakeBackend:
         ]
 
     def describe_filter(self, filter_name):
+        self.describe_filter_calls.append(filter_name)
         return {
             "description": f"How {filter_name} works.",
             "available_values": ["a", "b"],
         }
+
+    def filter_descriptions(self):
+        return {name: f"How {name} works." for name in self.filter_names()}
 
     def itemtext(self, table_name):
         return self.items.get(table_name, "unavailable")
@@ -446,7 +451,7 @@ def test_backend_ensure_ready_gates_every_call():
     assert error.value.code == "authentication_required"
 
 
-def test_server_exposes_exactly_the_seven_public_tools():
+def test_server_exposes_exactly_the_eight_public_tools():
     pytest.importorskip("mcp")
 
     async def check():
@@ -456,6 +461,7 @@ def test_server_exposes_exactly_the_seven_public_tools():
             listed = await client.list_tools()
             assert {tool.name for tool in listed.tools} == {
                 "search_tables",
+                "describe_filter",
                 "describe_table",
                 "fetch_table",
                 "get_itemtext",
@@ -463,6 +469,10 @@ def test_server_exposes_exactly_the_seven_public_tools():
                 "get_citation",
                 "get_processing_notes",
             }
+            # The filter list in the description has to be the package's, and
+            # this is the only test that sees the description the host reads.
+            search = next(t for t in listed.tools if t.name == "search_tables")
+            assert "- construct_type: How construct_type works." in search.description
             assert all(tool.annotations.read_only_hint is True for tool in listed.tools)
             result = await client.call_tool("search_tables", {"query": "math"})
             assert result.is_error is False
@@ -472,6 +482,7 @@ def test_server_exposes_exactly_the_seven_public_tools():
 
             calls = [
                 ("describe_table", {"table_name": "alpha_depression"}),
+                ("describe_filter", {"filter_name": "construct_type"}),
                 ("fetch_table", {"table_name": "alpha_depression", "limit": 1}),
                 ("get_itemtext", {"table_name": "alpha_depression", "limit": 1}),
                 ("list_collections", {"limit": 1}),
@@ -707,12 +718,26 @@ def test_the_search_tool_description_is_generated_from_the_package():
         assert f"- {name}: How {name} works." in doc
 
 
+def test_building_the_description_costs_no_redivis_call():
+    """describe_filter() loads the metadata tables to compute each filter's
+    values. Calling it to build a tool description put a download, and the
+    quota it spends, in the path of starting the server."""
+    from irw.mcp import _search_tables_doc
+
+    backend = FakeBackend()
+    _search_tables_doc(IRWTools(backend, FakeSource()))
+    assert backend.describe_filter_calls == []
+
+
 def test_the_description_still_builds_when_the_catalogue_is_unreachable():
     """A server that will not start is worse than one with a terse description."""
     from irw.mcp import _search_tables_doc
 
     class _Broken(FakeBackend):
         def filter_names(self):
+            raise ConnectionError("offline")
+
+        def filter_descriptions(self):
             raise ConnectionError("offline")
 
     doc = _search_tables_doc(IRWTools(_Broken(), FakeSource()))

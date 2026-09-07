@@ -196,6 +196,8 @@ class IRWBackend(Protocol):
 
     def filter_names(self) -> List[str]: ...
 
+    def filter_descriptions(self) -> Mapping[str, str]: ...
+
     def describe_filter(self, filter_name: str) -> Any: ...
 
     def itemtext(self, table_name: str) -> Any: ...
@@ -254,6 +256,15 @@ class PackageBackend:
 
     def filter_names(self) -> List[str]:
         return list(irw.get_filters())
+
+    def filter_descriptions(self) -> Mapping[str, str]:
+        # The descriptions are a module-level dict. describe_filter() also
+        # returns them, but only after loading the metadata tables to compute
+        # each filter's available values -- a network call and a slice of the
+        # export quota, which the tool description must not cost at startup.
+        from .operations.filter_info import FILTER_DESCRIPTIONS
+
+        return dict(FILTER_DESCRIPTIONS)
 
     def describe_filter(self, filter_name: str) -> Any:
         return irw.describe_filter(filter_name)
@@ -1175,20 +1186,24 @@ class IRWTools:
         return caveats
 
     def _filter_description(self, filter_name: str) -> Optional[str]:
-        """One filter's description text, or None if it cannot be loaded."""
-        if filter_name in self._filter_descriptions:
-            return self._filter_descriptions[filter_name]
-        text: Optional[str] = None
-        try:
-            details, _ = self._call(self.backend.describe_filter, filter_name)
-            if isinstance(details, Mapping):
-                value = details.get("description")
-                if isinstance(value, str) and value.strip():
-                    text = value.strip()
-        except IRWMCPError:
-            text = None
-        self._filter_descriptions[filter_name] = text
-        return text
+        """One filter's description text, or None if it cannot be loaded.
+
+        Deliberately not describe_filter(): that one computes each filter's
+        available values from the metadata tables, so calling it here would
+        put a Redivis download -- and the quota it spends -- in the path of
+        building a tool description at server startup. The descriptions
+        themselves are a plain dict in the package.
+        """
+        if not self._filter_descriptions:
+            try:
+                descriptions, _ = self._call(self.backend.filter_descriptions)
+            except IRWMCPError:
+                descriptions = {}
+            self._filter_descriptions = {
+                str(key): (str(value).strip() or None)
+                for key, value in (descriptions or {}).items()
+            }
+        return self._filter_descriptions.get(filter_name)
 
     def describe_table(self, table_name: str) -> Dict[str, Any]:
         table_name = _validate_table_name(table_name)
@@ -1634,7 +1649,18 @@ def create_server(
         idempotentHint=True,
     )
 
-    @server.tool(name="search_tables", annotations=read_only, structured_output=True)
+    # The description is built from the package's own filter list rather than
+    # written here, so a filter added to irw.filter() appears in this tool
+    # without anyone remembering to edit this file. It has to be passed to the
+    # decorator: the SDK reads the docstring at registration, so assigning
+    # __doc__ afterwards registers an empty description and no test that only
+    # calls the tool would notice.
+    @server.tool(
+        name="search_tables",
+        description=_search_tables_doc(tools),
+        annotations=read_only,
+        structured_output=True,
+    )
     def search_tables(
         query: str = "",
         filters: Optional[Dict[str, Any]] = None,
@@ -1642,13 +1668,6 @@ def create_server(
         offset: int = 0,
     ) -> Dict[str, Any]:
         return tools.search_tables(query, filters, limit, offset)
-
-    # The description is built from the package's own filter list rather than
-    # written here, so a filter added to irw.filter() appears in this tool
-    # without anyone remembering to edit this file. It is built once, at
-    # startup; if the catalogue cannot be reached the tool still registers
-    # with a description that says to call describe_filter.
-    search_tables.__doc__ = _search_tables_doc(tools)
 
     @server.tool(name="describe_filter", annotations=read_only, structured_output=True)
     def describe_filter(filter_name: str) -> Dict[str, Any]:
