@@ -1,0 +1,91 @@
+# Publishes the package to PyPI as https://pypi.org/project/irw/.
+#
+# The tag IS the trigger. There is deliberately no prepare/dispatch step that
+# opens a release PR: Rpkg's release-prepare.yaml does that and goes GREEN
+# without opening the PR, because "GitHub Actions is not permitted to create or
+# approve pull requests" is downgraded to a warning (Rpkg#136). A successful run
+# there is not evidence a release is in flight. Here it is.
+#
+# Release procedure: bump both version literals in one PR (pyproject.toml and
+# src/irw/config.py -- tests/test_version_string.py already fails if they
+# disagree), merge it, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+#
+# Authentication is PyPI Trusted Publishing (OIDC). There is no API token in
+# this repository and no `password:` input below; the publish job exchanges a
+# short-lived GitHub identity token for an upload token. That binding names this
+# workflow file and the `pypi` environment, so renaming either one breaks
+# publishing until the publisher is updated on pypi.org.
+#
+# workflow_dispatch runs everything except the upload. Use it to check that a
+# build and the version guard pass before burning a version number -- PyPI never
+# allows a version to be re-uploaded, even after deletion.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      # Before building, not after: a mismatch here means the artifact would
+      # carry a version number that disagrees with the tag people cite.
+      - name: Check tag and version literals agree
+        run: python .github/scripts/check_release_version.py "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
+
+      - run: python -m pip install --upgrade pip
+      - run: pip install build twine
+      - run: python -m build
+
+      # Catches a README that PyPI would reject, and an artifact whose metadata
+      # did not resolve (setuptools older than the pyproject floor names the
+      # package UNKNOWN rather than failing).
+      - run: python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # The entire OIDC integration. Nothing else is needed and no secret is
+      # read.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes

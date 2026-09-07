@@ -1,5 +1,12 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+# setuptools>=77 is a floor, not a preference. The `license = "MIT"` /
+# `license-files` pair below is PEP 639, which setuptools only understands from
+# 77.0.0. An isolated build (`python -m build`) resolves the newest setuptools
+# and is fine either way, but a NON-isolated build on an older one does not
+# error -- it silently emits `Name: UNKNOWN, Version: 0.0.0`, which is what the
+# stale UNKNOWN.egg-info/ in some working trees came from. That is the one
+# failure mode that could put an artifact on PyPI under the wrong name.
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -47,7 +54,9 @@ where = ["src"]
 
 [project.urls]
 Homepage = "https://itemresponsewarehouse.org/"
+Repository = "https://github.com/itemresponsewarehouse/Python-pkg"
 Issues = "https://github.com/itemresponsewarehouse/Python-pkg/issues"
+Changelog = "https://github.com/itemresponsewarehouse/Python-pkg/releases"
 
 # Lint only -- there is deliberately no formatter here. A formatter reflows
 # every file at once, which makes `git blame` less useful across the whole
