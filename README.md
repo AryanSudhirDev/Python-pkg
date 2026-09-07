@@ -16,8 +16,26 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install the package
 python -m pip install --upgrade pip
+python -m pip install irw
+```
+
+To upgrade an existing install:
+
+```bash
+python -m pip install --upgrade irw
+```
+
+### Development install
+
+To run against unreleased code on `main`:
+
+```bash
 python -m pip install "git+https://github.com/itemresponsewarehouse/Python-pkg.git"
 ```
+
+Note that this install does not upgrade cleanly: pip resolves the version from
+the clone, sees it already installed and skips, even under `--upgrade`. Use it
+when you want a specific commit, not as a way to stay current.
 
 ### Requirements
 
