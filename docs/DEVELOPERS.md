@@ -92,7 +92,15 @@ After releasing or sharing the update, ask users to **restart their Python sessi
 The optional MCP server lives in `src/irw/mcp.py` and is deliberately separate
 from the core API. Install it with `pip install "irw[mcp]"` on Python 3.10 or
 newer. The server uses the official MCP Python SDK over stdio and registers only
-the five read-only tools documented in the package README.
+the six read-only tools documented in the package README. Every response is
+stamped with `irw_version` from the version manifest so results can be pinned;
+the manifest is fetched once per server process and a load failure degrades to
+an unpinned result with a warning, never an error.
+
+Missing Redivis credentials are a structured `authentication_required` error,
+not a hang: the SDK's fallback is an interactive browser login that can never
+complete inside a stdio server, so `PackageBackend.ensure_ready` checks for
+`REDIVIS_API_TOKEN` or `~/.redivis/python_credentials` before every call.
 
 Keep stdout clean: MCP protocol messages use stdout, while diagnostics belong
 on stderr. The adapter captures human-readable output and warnings emitted by

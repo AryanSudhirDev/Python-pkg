@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import math
+import os
 import re
 import sys
 import threading
@@ -21,6 +22,7 @@ import warnings
 from collections.abc import Mapping
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
@@ -40,6 +42,15 @@ ROW_MAX_LIMIT = 1000
 ITEMTEXT_MAX_LIMIT = 500
 COLLECTION_DEFAULT_LIMIT = 100
 COLLECTION_MAX_LIMIT = 200
+
+AUTH_SETUP_MESSAGE = (
+    "No Redivis credentials were found. The Redivis SDK would open an "
+    "interactive browser login, which cannot complete inside an MCP server. "
+    "Authenticate once in a regular terminal with "
+    "`python -c \"import irw; irw.list_tables()\"` (credentials are cached in "
+    "~/.redivis), or set the REDIVIS_API_TOKEN environment variable for the "
+    "MCP host, then retry."
+)
 
 ITEMTEXT_DISCLAIMER = (
     "IRW item text is reconstructed from published sources with partial human "
@@ -107,9 +118,28 @@ class IRWBackend(Protocol):
 
     def collections(self) -> pd.DataFrame: ...
 
+    def citation(self, table_name: str) -> List[str]: ...
+
+    def version_manifest(self) -> pd.DataFrame: ...
+
 
 class PackageBackend:
     """Default backend that delegates to the public ``irw`` API."""
+
+    def ensure_ready(self) -> None:
+        """Refuse to start a Redivis call that would block on a browser login.
+
+        The Redivis SDK's fallback for missing credentials is an interactive
+        device-authorization flow that prints a URL and polls for up to ten
+        minutes. Inside a stdio MCP server that print is captured and the
+        tool call simply hangs, so the absence of credentials has to be an
+        error the client can read, not a wait.
+        """
+        if os.getenv("REDIVIS_API_TOKEN"):
+            return
+        if (Path.home() / ".redivis" / "python_credentials").is_file():
+            return
+        raise IRWMCPError("authentication_required", AUTH_SETUP_MESSAGE)
 
     def list_tables(self) -> pd.DataFrame:
         return irw.list_tables(source=SOURCE, include_metadata=True)
@@ -125,6 +155,12 @@ class PackageBackend:
 
     def collections(self) -> pd.DataFrame:
         return irw.collections()
+
+    def citation(self, table_name: str) -> List[str]:
+        return irw.save_bibtex(table_name)
+
+    def version_manifest(self) -> pd.DataFrame:
+        return irw.version()
 
 
 @dataclass
@@ -217,6 +253,12 @@ def _map_exception(error: Exception) -> IRWMCPError:
         )
     if "not found" in message or "not_found" in message:
         return IRWMCPError("not_found", "The requested IRW resource was not found.")
+    if "quota" in message:
+        return IRWMCPError(
+            "quota_exceeded",
+            "The Redivis export quota for this account is exhausted. Wait for "
+            "the quota to reset before fetching more data.",
+        )
     if any(marker in message for marker in _TRANSIENT_MARKERS):
         return IRWMCPError(
             "upstream_unavailable",
@@ -431,17 +473,22 @@ class IRWTools:
     def __init__(self, backend: Optional[IRWBackend] = None) -> None:
         self.backend = backend or PackageBackend()
         self._capture_lock = threading.Lock()
+        self._irw_version: Optional[str] = None
+        self._irw_version_checked = False
 
     def _call(
         self, callback: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Tuple[Any, List[str]]:
         """Run package code without allowing stdout to corrupt MCP stdio."""
         callback_name = getattr(callback, "__name__", callback.__class__.__name__)
+        ensure_ready = getattr(self.backend, "ensure_ready", None)
         with self._capture_lock:
             with redirect_stdout(io.StringIO()) as captured_stdout:
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     try:
+                        if ensure_ready is not None:
+                            ensure_ready()
                         value = callback(*args, **kwargs)
                     except Exception as error:
                         if captured_stdout.getvalue().strip():
@@ -452,6 +499,35 @@ class IRWTools:
         if captured_stdout.getvalue().strip():
             logger.debug("Suppressed package output from %s", callback_name)
         return value, _warning_messages(caught)
+
+    def _stamp(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the IRW corpus version so any result can be pinned.
+
+        IRW is many independently versioned Redivis datasets; the manifest's
+        ``irw_version`` is the only number that names the corpus as a whole.
+        The manifest is fetched once per server process; when it cannot be
+        loaded, results ship unpinned with a warning rather than failing.
+        """
+        if not self._irw_version_checked:
+            self._irw_version_checked = True
+            manifest = getattr(self.backend, "version_manifest", None)
+            if manifest is not None:
+                try:
+                    frame, _ = self._call(manifest)
+                    version = getattr(frame, "attrs", {}).get("irw_version")
+                    self._irw_version = None if version is None else str(version)
+                except IRWMCPError:
+                    self._irw_version = None
+        payload["irw_version"] = self._irw_version
+        if self._irw_version is None:
+            message = (
+                "The IRW version manifest could not be loaded; this result is "
+                "not pinned to an IRW version."
+            )
+            warning_list = payload.setdefault("warnings", [])
+            if message not in warning_list:
+                warning_list.append(message)
+        return payload
 
     def search_tables(
         self,
@@ -545,15 +621,17 @@ class IRWTools:
         matches.sort(key=lambda item: (-item[0], item[1]))
         total = len(matches)
         page = [record for _, _, record in matches[offset : offset + limit]]
-        return {
-            "source": SOURCE,
-            "tables": page,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "has_more": offset + len(page) < total,
-            "warnings": state.warnings,
-        }
+        return self._stamp(
+            {
+                "source": SOURCE,
+                "tables": page,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "has_more": offset + len(page) < total,
+                "warnings": state.warnings,
+            }
+        )
 
     def describe_table(self, table_name: str) -> Dict[str, Any]:
         table_name = _validate_table_name(table_name)
@@ -569,13 +647,15 @@ class IRWTools:
         if not isinstance(metadata, Mapping):
             metadata = {"raw": metadata}
         schema = metadata.get("schema") or metadata.get("columns")
-        return {
-            "source": SOURCE,
-            "table": table_name,
-            "metadata": dict(metadata),
-            "schema": schema,
-            "warnings": state.warnings,
-        }
+        return self._stamp(
+            {
+                "source": SOURCE,
+                "table": table_name,
+                "metadata": dict(metadata),
+                "schema": schema,
+                "warnings": state.warnings,
+            }
+        )
 
     def fetch_table(
         self,
@@ -624,7 +704,7 @@ class IRWTools:
         payload.update(
             {"source": SOURCE, "table": table_name, "wide": wide, "dedup": dedup}
         )
-        return payload
+        return self._stamp(payload)
 
     def get_itemtext(
         self,
@@ -642,21 +722,23 @@ class IRWTools:
             for message in package_warnings:
                 state.add(message)
             state.add(ITEMTEXT_DISCLAIMER)
-            return {
-                "source": SOURCE,
-                "table": table_name,
-                "available": False,
-                "items": [],
-                "columns": [],
-                "total_items": 0,
-                "offset": offset,
-                "limit": limit,
-                "returned": 0,
-                "has_more": False,
-                "truncated": False,
-                "disclaimer": ITEMTEXT_DISCLAIMER,
-                "warnings": state.warnings,
-            }
+            return self._stamp(
+                {
+                    "source": SOURCE,
+                    "table": table_name,
+                    "available": False,
+                    "items": [],
+                    "columns": [],
+                    "total_items": 0,
+                    "offset": offset,
+                    "limit": limit,
+                    "returned": 0,
+                    "has_more": False,
+                    "truncated": False,
+                    "disclaimer": ITEMTEXT_DISCLAIMER,
+                    "warnings": state.warnings,
+                }
+            )
 
         payload = _page_dataframe(
             value,
@@ -675,7 +757,7 @@ class IRWTools:
                 "disclaimer": ITEMTEXT_DISCLAIMER,
             }
         )
-        return payload
+        return self._stamp(payload)
 
     def list_collections(
         self,
@@ -699,15 +781,43 @@ class IRWTools:
         records.sort(key=lambda record: str(record.get("collection", "")).casefold())
         total = len(records)
         page = records[offset : offset + limit]
-        return {
-            "source": SOURCE,
-            "collections": page,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "has_more": offset + len(page) < total,
-            "warnings": state.warnings,
-        }
+        return self._stamp(
+            {
+                "source": SOURCE,
+                "collections": page,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "has_more": offset + len(page) < total,
+                "warnings": state.warnings,
+            }
+        )
+
+    def get_citation(self, table_name: str) -> Dict[str, Any]:
+        table_name = _validate_table_name(table_name)
+        entries, package_warnings = self._call(self.backend.citation, table_name)
+        state = _ConversionState()
+        for message in package_warnings:
+            state.add(message)
+        if entries is None:
+            entries = []
+        elif isinstance(entries, str):
+            entries = [entries]
+        bibtex = [str(entry).strip() for entry in entries if str(entry).strip()]
+        if not bibtex:
+            state.add(
+                f"No BibTeX entry could be resolved for '{table_name}'. Cite the "
+                "IRW itself and check the table's bibliography metadata by hand."
+            )
+        return self._stamp(
+            {
+                "source": SOURCE,
+                "table": table_name,
+                "available": bool(bibtex),
+                "bibtex": bibtex,
+                "warnings": state.warnings,
+            }
+        )
 
 
 def create_server(backend: Optional[IRWBackend] = None) -> Any:
@@ -750,7 +860,10 @@ def create_server(backend: Optional[IRWBackend] = None) -> Any:
 
         Results are paginated with a default limit of 20 and a maximum of 100.
         Use structured filters for collections, variables, licenses, longitudinal
-        studies, and item-text availability.
+        studies, and item-text availability. Unlike the irw package's filter(),
+        no default density filter is applied: sparse tables appear in results,
+        so check a table's density statistic before drawing per-person
+        conclusions.
         """
         return tools.search_tables(
             query,
@@ -780,7 +893,14 @@ def create_server(backend: Optional[IRWBackend] = None) -> Any:
         """Fetch a bounded page of rows from one IRW table.
 
         The default page is 100 rows and the maximum is 1,000. Use offset for
-        subsequent pages and columns to reduce the response size.
+        subsequent pages and columns to reduce the response size. Note that the
+        whole table is downloaded from Redivis before paging, so the first call
+        for a table counts fully against the account's Redivis export quota
+        regardless of limit. Response values keep the source's coding: higher
+        resp is consistent within an item, but reverse-scored items are NOT
+        recoded, so direction may vary across items. Duplicate id-item pairs
+        are kept unless dedup=true (they are meaningful in longitudinal
+        tables).
         """
         return tools.fetch_table(table_name, limit, offset, columns, wide, dedup)
 
@@ -801,11 +921,23 @@ def create_server(backend: Optional[IRWBackend] = None) -> Any:
         """List IRW's labelled collections and their metadata."""
         return tools.list_collections(limit, offset)
 
+    @server.tool(name="get_citation", annotations=read_only, structured_output=True)
+    def get_citation(table_name: str) -> Dict[str, Any]:
+        """Return BibTeX for the original data producers of one IRW table.
+
+        Cite the original producers, not only the IRW, when using a table.
+        """
+        return tools.get_citation(table_name)
+
     return server
 
 
 def main() -> None:
     """Run the local stdio server for an MCP host."""
+    # The redivis client draws tqdm progress bars during downloads. They go to
+    # stderr, so they cannot corrupt the stdio protocol, but they flood the MCP
+    # host's log with carriage-return spam on every fetch.
+    os.environ.setdefault("TQDM_DISABLE", "1")
     try:
         server = create_server()
     except RuntimeError as error:

@@ -82,6 +82,18 @@ class FakeBackend:
             }
         )
 
+    def citation(self, table_name):
+        if table_name == "alpha_depression":
+            return ["@article{alpha_depression,\n  title={Depression scale}\n}"]
+        return []
+
+    def version_manifest(self):
+        frame = pd.DataFrame(
+            {"dataset": ["item_response_warehouse"], "version": ["v11.0"]}
+        )
+        frame.attrs["irw_version"] = "42"
+        return frame
+
 
 @pytest.fixture
 def tools():
@@ -182,7 +194,57 @@ def test_collections_are_structured_and_paginated(tools):
     assert result["has_more"] is True
 
 
-def test_server_exposes_exactly_the_five_public_tools():
+def test_get_citation_returns_bibtex(tools):
+    result = tools.get_citation("alpha_depression")
+    assert result["available"] is True
+    assert result["bibtex"][0].startswith("@article{alpha_depression")
+
+
+def test_get_citation_missing_is_soft_not_an_error(tools):
+    result = tools.get_citation("beta_math")
+    assert result["available"] is False
+    assert result["bibtex"] == []
+    assert any("BibTeX" in warning for warning in result["warnings"])
+
+
+def test_responses_are_stamped_with_irw_version(tools):
+    assert tools.search_tables()["irw_version"] == "42"
+    assert tools.list_collections()["irw_version"] == "42"
+    assert tools.fetch_table("alpha_depression")["irw_version"] == "42"
+
+
+def test_version_stamp_degrades_to_a_warning_when_manifest_fails():
+    class BrokenManifest(FakeBackend):
+        def version_manifest(self):
+            raise RuntimeError("connection timed out")
+
+    result = IRWTools(BrokenManifest()).search_tables()
+    assert result["irw_version"] is None
+    assert any("not pinned" in warning for warning in result["warnings"])
+
+
+def test_missing_credentials_are_an_error_not_a_hang(monkeypatch, tmp_path):
+    from irw.mcp import PackageBackend
+
+    monkeypatch.delenv("REDIVIS_API_TOKEN", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with pytest.raises(IRWMCPError) as error:
+        PackageBackend().ensure_ready()
+    assert error.value.code == "authentication_required"
+    assert "REDIVIS_API_TOKEN" in error.value.message
+
+
+def test_backend_ensure_ready_gates_every_call():
+    class Unauthenticated(FakeBackend):
+        def ensure_ready(self):
+            raise IRWMCPError("authentication_required", "no credentials")
+
+    with pytest.raises(IRWMCPError) as error:
+        IRWTools(Unauthenticated()).search_tables()
+    assert error.value.code == "authentication_required"
+
+
+def test_server_exposes_exactly_the_six_public_tools():
     pytest.importorskip("mcp")
 
     async def check():
@@ -196,6 +258,7 @@ def test_server_exposes_exactly_the_five_public_tools():
                 "fetch_table",
                 "get_itemtext",
                 "list_collections",
+                "get_citation",
             }
             assert all(tool.annotations.read_only_hint is True for tool in listed.tools)
             result = await client.call_tool("search_tables", {"query": "math"})
@@ -209,6 +272,7 @@ def test_server_exposes_exactly_the_five_public_tools():
                 ("fetch_table", {"table_name": "alpha_depression", "limit": 1}),
                 ("get_itemtext", {"table_name": "alpha_depression", "limit": 1}),
                 ("list_collections", {"limit": 1}),
+                ("get_citation", {"table_name": "alpha_depression"}),
             ]
             for name, arguments in calls:
                 result = await client.call_tool(name, arguments)

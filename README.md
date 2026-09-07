@@ -109,7 +109,9 @@ irw.version("2026-08-01")             # what was live on that date
 
 IRW can run as a local, read-only Model Context Protocol server for an
 MCP-capable research assistant. The server exposes `search_tables`,
-`describe_table`, `fetch_table`, `get_itemtext`, and `list_collections`.
+`describe_table`, `fetch_table`, `get_itemtext`, `list_collections`, and
+`get_citation`. Every response carries an `irw_version` field so results can
+be pinned to a released IRW version.
 
 The MCP server requires Python 3.10 or newer because the current MCP SDK does.
 It does not make OpenAI calls and does not require an OpenAI key; the host
@@ -119,6 +121,13 @@ handled by the `irw` package.
 ```bash
 python -m pip install "irw[mcp]"
 ```
+
+Authenticate with Redivis **before** first use. The Redivis SDK's interactive
+browser login cannot complete inside an MCP server, so the server refuses to
+start a call without credentials (error code `authentication_required`) rather
+than hanging. Either run one call in a regular terminal —
+`python -c "import irw; irw.list_tables()"` — which caches credentials in
+`~/.redivis`, or set `REDIVIS_API_TOKEN` in the MCP host's environment.
 
 Configure an MCP host to start this local process:
 
@@ -131,10 +140,14 @@ Configure an MCP host to start this local process:
 
 `fetch_table` and `get_itemtext` always return bounded pages. They default to
 100 rows, accept an `offset`, and include `has_more` and `truncated` fields.
-The maximum is 1,000 response rows and 500 item-text rows. Item text may be
-reconstructed or incomplete; verify it against the original source, and note
-that response-data licenses do not automatically grant rights to reuse an
-instrument.
+The maximum is 1,000 response rows and 500 item-text rows. Note that paging
+happens locally: the underlying package downloads the whole table on a
+table's first fetch, which counts against the account's Redivis export quota
+regardless of the requested `limit`. Item text may be reconstructed or
+incomplete; verify it against the original source, and note that
+response-data licenses do not automatically grant rights to reuse an
+instrument. `get_citation` returns BibTeX for the original data producers,
+who should be cited alongside the IRW.
 
 The process uses stdio, so it is intended to be launched by a local MCP host.
 It is not a hosted HTTP endpoint and cannot be called directly by a static
