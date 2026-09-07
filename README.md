@@ -108,10 +108,21 @@ irw.version("2026-08-01")             # what was live on that date
 ## MCP server
 
 IRW can run as a local, read-only Model Context Protocol server for an
-MCP-capable research assistant. The server exposes `search_tables`,
-`describe_table`, `fetch_table`, `get_itemtext`, `list_collections`, and
-`get_citation`. Every response carries an `irw_version` field so results can
-be pinned to a released IRW version.
+MCP-capable research assistant (issue ben-domingue/irw#1713). Seven tools:
+
+| Tool | What it does | Costs Redivis quota? |
+|---|---|---|
+| `search_tables` | catalogue search with collection / variable / licence / longitudinal / item-text filters; every record says whether it is `tagged` | no |
+| `describe_table` | statistics, tags, bibliography for one table | no |
+| `get_processing_notes` | the header of the script that built the table, from the IRW GitHub repository: whether `id` links across waves, what a `cov_*` means, what was excluded | no (no login either) |
+| `fetch_table` | a bounded page of rows; refuses tables above 1,000,000 responses **before** downloading | yes, the whole table |
+| `get_itemtext` | a bounded page of item text with a `rights` object: response-data licence, the instrument-rights rule, and the table's public notes | small |
+| `list_collections` | the labelled collections | no |
+| `get_citation` | BibTeX for the original data producers | no |
+
+Every response carries `irw_version` and `irw_released_at`, the citable
+version of the corpus, so anything an assistant produces can be pinned. The
+server's own version is the `irw` package version, not the data.
 
 The MCP server requires Python 3.10 or newer because the current MCP SDK does.
 It does not make OpenAI calls and does not require an OpenAI key; the host
@@ -125,8 +136,8 @@ python -m pip install "irw[mcp]"
 Authenticate with Redivis **before** first use. The Redivis SDK's interactive
 browser login cannot complete inside an MCP server, so the server refuses to
 start a call without credentials (error code `authentication_required`) rather
-than hanging. Either run one call in a regular terminal —
-`python -c "import irw; irw.list_tables()"` — which caches credentials in
+than hanging. Either run one call in a regular terminal --
+`python -c "import irw; irw.list_tables()"` -- which caches credentials in
 `~/.redivis`, or set `REDIVIS_API_TOKEN` in the MCP host's environment.
 
 Configure an MCP host to start this local process:
@@ -138,16 +149,22 @@ Configure an MCP host to start this local process:
 }
 ```
 
-`fetch_table` and `get_itemtext` always return bounded pages. They default to
-100 rows, accept an `offset`, and include `has_more` and `truncated` fields.
-The maximum is 1,000 response rows and 500 item-text rows. Note that paging
-happens locally: the underlying package downloads the whole table on a
-table's first fetch, which counts against the account's Redivis export quota
-regardless of the requested `limit`. Item text may be reconstructed or
-incomplete; verify it against the original source, and note that
-response-data licenses do not automatically grant rights to reuse an
-instrument. `get_citation` returns BibTeX for the original data producers,
-who should be cited alongside the IRW.
+`fetch_table` and `get_itemtext` return bounded pages (default 100 rows,
+`offset` for the next page, `has_more` and `truncated` fields; maximum 1,000
+response rows and 500 item-text rows). Paging happens locally: `irw.fetch()`
+has no row argument, so a fetch downloads the whole table against the
+account's 30-day Redivis export quota. That is why the size guard is a
+pre-check on the catalogue's `n_responses` (error `table_too_large`) rather
+than a truncation after the download -- the same 1,000,000-response rule the
+agents briefing (`llms.txt`) gives researchers.
+
+The tool descriptions carry the traps the briefing documents: tags are
+incomplete, so an untagged table is not a non-match; `longitudinal` is a grep
+of the variable string; response direction is not recoded across items;
+duplicate id-item rows can be real data; and the deposit licence is not an
+instrument licence. Item text may be reconstructed or incomplete; verify it
+against the original source, and read `rights.public_notes` (withdrawn
+wording, machine translations, known mismatches) before using it.
 
 The process uses stdio, so it is intended to be launched by a local MCP host.
 It is not a hosted HTTP endpoint and cannot be called directly by a static

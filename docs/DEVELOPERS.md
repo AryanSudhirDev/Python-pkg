@@ -91,25 +91,42 @@ After releasing or sharing the update, ask users to **restart their Python sessi
 
 The optional MCP server lives in `src/irw/mcp.py` and is deliberately separate
 from the core API. Install it with `pip install "irw[mcp]"` on Python 3.10 or
-newer. The server uses the official MCP Python SDK over stdio and registers only
-the six read-only tools documented in the package README. Every response is
-stamped with `irw_version` from the version manifest so results can be pinned;
-the manifest is fetched once per server process and a load failure degrades to
-an unpinned result with a warning, never an error.
+newer. The server uses the official MCP Python SDK over stdio and registers the
+seven read-only tools documented in the package README. Every response is
+stamped with `irw_version` / `irw_released_at` from `current_version()`; a
+manifest failure degrades to an unpinned result with a warning, never an error.
 
-Missing Redivis credentials are a structured `authentication_required` error,
-not a hang: the SDK's fallback is an interactive browser login that can never
-complete inside a stdio server, so `PackageBackend.ensure_ready` checks for
-`REDIVIS_API_TOKEN` or `~/.redivis/python_credentials` before every call.
+Two sources feed the tools. `PackageBackend` wraps the public `irw` API for
+everything on Redivis. `GitHubSource` reads public files with no login and no
+quota: the `data/` script listing and headers (`get_processing_notes`), the
+per-table notes embedded in the site's `itemtext_issues.qmd` (the `rights`
+object on `get_itemtext`), and `processing_notes/validator_overrides.csv`.
+Both are injectable, which is how the offline tests run without a network.
+
+Guards happen before the call that would cost something. Missing Redivis
+credentials are a structured `authentication_required` error, not a hang: the
+SDK's fallback is an interactive browser login that can never complete inside
+a stdio server, so `PackageBackend.ensure_ready` checks for `REDIVIS_API_TOKEN`
+or `~/.redivis/python_credentials` first. The `fetch_table` size guard reads
+`n_responses` from the catalogue and refuses above `FETCH_MAX_RESPONSES`
+(1,000,000, the same number as `llms.txt` section 3) because `irw.fetch()` has
+no row argument and a post-hoc cap would have spent the quota already.
 
 Keep stdout clean: MCP protocol messages use stdout, while diagnostics belong
 on stderr. The adapter captures human-readable output and warnings emitted by
 the existing package APIs and returns warnings in the structured tool result.
 Do not add OpenAI or other model-provider dependencies to this package.
 
-Tests use a fake backend and do not require Redivis credentials. Live checks
-should remain opt-in through the existing `RUN_REDIVIS_TESTS=1` convention.
+Tests use a fake backend and a fake GitHub source and do not require Redivis
+credentials or a network. The live machine checks in `tests/test_mcp_live.py`
+follow `briefing-check/` in the site repository -- every assertion is one a
+silent no-op cannot satisfy -- and are opt-in:
 
+```bash
+RUN_REDIVIS_TESTS=1 python -m pytest tests/test_mcp_live.py -v
+```
+
+They download one 72-row table and nothing else.
 
 ## Collections (issue #1633)
 
