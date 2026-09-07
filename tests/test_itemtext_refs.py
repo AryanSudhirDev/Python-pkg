@@ -154,3 +154,56 @@ def test_name_index_prefers_the_newest_shard(mock_init, monkeypatch):
                               fake_shard("irw_text_2:2", ["shared"])]
     # Reversed to newest-first inside _get_itemtext_datasets, so shard 2 wins.
     assert it._itemtext_name_index()["shared"] == "shared"
+
+
+class _Handle:
+    def __init__(self, name, missing):
+        self.name = name
+        self._missing = missing
+
+    def get(self):
+        if self._missing:
+            raise Exception(f"Not found: datapages.irw_text_2:2:v1_1.{self.name}")
+
+
+class _Shard:
+    """A dataset whose `table()` hands back a handle that only fails on get()."""
+
+    def __init__(self, ds_id, present):
+        self._id = ds_id
+        self._present = set(present)
+
+    def list_tables(self):
+        return [FakeTable(n) for n in self._present]
+
+    def table(self, name):
+        return _Handle(name, name not in self._present)
+
+
+def test_real_get_table_surfaces_not_found_instead_of_a_phantom_handle():
+    """Regression: `_get_table` swallowed the not-found from `tbl.get()`, so the
+    newest shard claimed every name and 732 tables lost their item text."""
+    from irw.utils.redivis.tables import _get_table
+
+    new = _Shard("irw_text_2:2", [])
+    old = _Shard("irw_text:1", ["only_old__items"])
+    with pytest.raises(Exception, match="Not found"):
+        _get_table(new, "only_old__items")
+    assert _get_table(old, "only_old__items").name == "only_old__items"
+
+
+@patch("irw.utils.redivis.item_text._init_datasets_from_refs")
+def test_lookup_falls_through_a_newer_shard_using_the_real_get_table(mock_init, monkeypatch):
+    """Same scenario, end to end, without mocking `_get_table` away -- the mock in
+    the routing test above is exactly what hid the bug."""
+    monkeypatch.setattr(
+        "irw.utils.redivis.item_text.ITEMTEXT_REFS",
+        (("u", "irw_text:1"), ("u", "irw_text_2:2")),
+    )
+    old = _Shard("irw_text:1", ["only_old__items"])
+    new = _Shard("irw_text_2:2", ["newer__items"])
+    mock_init.return_value = [old, new]
+    handle = it._get_itemtext_table("only_old")
+    assert handle.name == "only_old__items"
+    assert it._get_itemtext_table("newer").name == "newer__items"
+    assert it._get_itemtext_table("absent") is None
