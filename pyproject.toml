@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "irw"
-version = "0.1.3"
+version = "0.1.4"
 authors = [
   { name="Hansol Lee", email="hansol@stanford.edu" },
   { name="Ben Domingue", email="bdomingu@stanford.edu" }
@@ -49,6 +49,7 @@ license-files = ["LICEN[CS]E*"]
 # 3.9 support and make this feature opt-in.
 mcp = [
     "mcp>=2.1,<3; python_version >= '3.10'",
+    "PyYAML>=6,<7; python_version >= '3.10'",
 ]
 
 [project.scripts]

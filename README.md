@@ -130,9 +130,11 @@ than guess at a spelling. One deliberate difference from `irw.filter()`: no
 default `density` filter is applied, because its `[0.5, 1]` default silently
 removes sparse tables from a search nobody asked to be about density.
 
-Every response carries `irw_version` and `irw_released_at`, the citable
-version of the corpus, so anything an assistant produces can be pinned. The
-server's own version is the `irw` package version, not the data.
+Every response carries an observed `irw_version` and `irw_released_at` when
+the public manifest is available, plus `retrieved_at`. This does not pin reads
+from independently versioned Redivis tables: `data_pinned` is explicitly false.
+Processing-script links do use an immutable Git commit. The server's own
+version is the `irw` package version, not the data.
 
 The MCP server requires Python 3.10 or newer because the current MCP SDK does.
 It does not make OpenAI calls and does not require an OpenAI key; the host
@@ -140,8 +142,14 @@ application is responsible for the model. Redivis authentication is still
 handled by the `irw` package.
 
 ```bash
-python -m pip install "irw[mcp]"
+python3 -m venv .venv
+.venv/bin/python -m pip install ".[mcp]"
+.venv/bin/python -c "import sys; from pathlib import Path; print(Path(sys.executable).with_name('irw-mcp'))"
 ```
+
+These commands install the local checkout. For an index installation, use
+`"irw[mcp]>=0.1.4"` only after that release is published; 0.1.3 does not include
+this server. On Windows, use `.venv\Scripts\python.exe` instead.
 
 Authenticate with Redivis **before** first use. The Redivis SDK's interactive
 browser login cannot complete inside an MCP server, so the server refuses to
@@ -150,21 +158,31 @@ than hanging. Either run one call in a regular terminal --
 `python -c "import irw; irw.list_tables()"` -- which caches credentials in
 `~/.redivis`, or set `REDIVIS_API_TOKEN` in the MCP host's environment.
 
-Configure an MCP host to start this local process:
+Configure an MCP host to start the installed launcher by its absolute path.
+Add the `irw` entry to any existing `mcpServers` object; do not replace other
+servers. Tokens set in a terminal are not necessarily inherited by a desktop
+application: configure the host's environment without committing secrets.
 
 ```json
 {
-  "command": "irw-mcp",
-  "args": []
+  "mcpServers": {
+    "irw": {
+      "command": "/absolute/path/to/.venv/bin/irw-mcp",
+      "args": []
+    }
+  }
 }
 ```
 
 `fetch_table` and `get_itemtext` return bounded pages (default 100 rows,
 `offset` for the next page, `has_more` and `truncated` fields; maximum 1,000
-response rows and 500 item-text rows). The window is bounded on the wire:
+response rows and 500 item-text rows). These are storage-order previews, not
+random samples. Follow `next_offset`; a full page does not prove another row
+exists. Ordinary response-data windows are bounded on the wire:
 `fetch_table` passes `max_rows` and `columns` to `irw.fetch()`, which hands
-both to Redivis's read session, so a page of a 107M-response table costs a
-page rather than 2.7 GB of the account's 30-day export quota. Rows come back
+both to Redivis's read session. Each page reads `offset + limit` rows, including
+the prefix discarded for later pages; this sum is capped at 10,000. Item text
+may require fetching an entire text shard before paging. Rows come back
 columnar -- `columns` names the fields and each entry of `rows` is a list of
 values in that order -- which is about half the response size of repeating
 every column name on every row.
@@ -178,8 +196,20 @@ be the more convenient answer and the wrong one.
 whole table -- dedup can only drop the duplicates it can see, and the reshape
 uses whatever rows it is given -- so they cannot be bounded to a page. Those
 calls download the table, say so in `warnings`, and are refused above
-1,000,000 responses (error `table_too_large`), the same rule the agents
+1,000,000 responses (error `table_too_large`) or when size is unknown
+(`table_size_unknown`), following the size threshold the agents
 briefing (`llms.txt`) gives researchers.
+
+Responses have a 256 KiB application-JSON limit. Pages shrink only by complete
+records and include `next_offset`; indivisible oversized records return an
+error, not shortened wording or citations. `columns` selects output columns,
+including item columns after `wide=true` reshaping. Numeric filter values must
+be finite numbers or one/two-element numeric lists; malformed filters fail.
+
+Processing notes are best-effort header extraction, not a complete execution
+trace or proof of suitability. Ambiguous script families are reported without
+choosing a script. Item text distinguishes `available`, `unavailable`, and
+`fetch_failed`; an expected text retrieval failure is not an empty dataset.
 
 The tool descriptions carry the traps the briefing documents: tags are
 incomplete, so an untagged table is not a non-match; `longitudinal` is a grep

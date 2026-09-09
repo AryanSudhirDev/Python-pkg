@@ -181,7 +181,9 @@ def fetch(
         These are the table's first ``max_rows`` rows in storage order, not a
         random sample, so they are not representative of the table.
     columns : list of str, optional
-        Return only these columns. Also pushed to Redivis.
+        Return only these output columns, in the requested order. Pushed to
+        Redivis for ordinary reads; applied after deduplication or reshaping
+        when those operations need additional input columns.
         
     Returns
     -------
@@ -189,6 +191,9 @@ def fetch(
         Single table returns DataFrame, multiple return dict.
         If wide=True, returns wide-format response matrix instead of long format.
     """
+    from .operations.fetch import _validate_pushdown
+
+    max_rows, columns = _validate_pushdown(max_rows, columns)
     datasets = _get_datasets(source)
     if wide and max_rows is not None:
         # long2resp infers the response matrix from the rows it is given, so a
@@ -203,14 +208,16 @@ def fetch(
             stacklevel=2,
         )
     result = _fetch(
-        datasets, table_name, dedup=dedup, max_rows=max_rows, columns=columns
+        datasets, table_name, dedup=dedup, max_rows=max_rows,
+        columns=None if wide else columns
     )
     
     # Handle single DataFrame result
     if isinstance(result, pd.DataFrame):
         # If wide=True, convert to response matrix
         if wide:
-            return _long2resp(result, wave=None, id_density_threshold=0.1, agg_method="mean")
+            result = _long2resp(result, wave=None, id_density_threshold=0.1, agg_method="mean")
+            return result if columns is None else result.loc[:, columns]
         return result
     
     # Handle dict of DataFrames
@@ -220,7 +227,8 @@ def fetch(
             if v is not None:
                 # If wide=True, convert each table
                 if wide:
-                    out[k] = _long2resp(v, wave=None, id_density_threshold=0.1, agg_method="mean")
+                    reshaped = _long2resp(v, wave=None, id_density_threshold=0.1, agg_method="mean")
+                    out[k] = reshaped if columns is None else reshaped.loc[:, columns]
                 else:
                     out[k] = v
             else:

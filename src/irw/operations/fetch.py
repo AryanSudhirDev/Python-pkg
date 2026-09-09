@@ -193,7 +193,9 @@ def _fetch_one_table(
     def _load_table(ds: Any) -> pd.DataFrame:
         tbl = _get_table(ds, name)
         df = _retry_transient(
-            lambda: tbl.to_pandas_dataframe(max_rows, variables=column_list)
+            lambda: tbl.to_pandas_dataframe(
+                max_rows, variables=None if dedup else column_list
+            )
         )
 
         # --- inline transforms needed only for fetch() ---
@@ -226,7 +228,10 @@ def _fetch_one_table(
         # Dedup without pandas GroupBy.apply warning
         if dedup:
             if "date" in df.columns:
-                logger.info(f"Deduplication skipped for dataset '{name}': 'date' column detected (timestamped responses).")
+                warnings.warn(
+                    f"Deduplication skipped for dataset '{name}': 'date' column detected (timestamped responses).",
+                    UserWarning, stacklevel=2,
+                )
             elif {"id", "item"}.issubset(df.columns):
                 keys = ["id", "item"] + (["wave"] if "wave" in df.columns else [])
                 msg = (
@@ -239,14 +244,21 @@ def _fetch_one_table(
                 groups = df.groupby(keys, dropna=False).indices  # dict[group_key -> ndarray of row indices]
                 if groups:
                     chosen_idx = [rng.choice(ix) for ix in groups.values()]
-                    df = df.loc[sorted(chosen_idx)].reset_index(drop=True)
+                    df = df.iloc[sorted(chosen_idx)].reset_index(drop=True)
                     if len(df) < n0:
                         logger.info(msg)
                     else:
                         logger.info(f"Deduplication not needed for dataset '{name}': no duplicate responses found.")
                 else:
                     logger.info(f"Deduplication not needed for dataset '{name}': no duplicate responses found.")
-            # else: if missing id/item, silently skip dedup (matches R spirit)
+            else:
+                warnings.warn(
+                    f"Deduplication skipped for dataset '{name}': missing id or item column.",
+                    UserWarning, stacklevel=2,
+                )
+
+        if dedup and column_list is not None:
+            df = df.loc[:, column_list]
 
         return pd.DataFrame(df)
 

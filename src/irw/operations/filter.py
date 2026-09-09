@@ -2,9 +2,45 @@
 
 from typing import List, Optional, Union
 import re
+import math
+from numbers import Real
 import pandas as pd
 import numpy as np
 from ..operations.list_tables import list_tables, IRWMetadataUnavailable
+
+
+NUMERIC_FILTERS = frozenset({
+    'n_responses', 'n_categories', 'n_participants', 'n_items',
+    'responses_per_participant', 'responses_per_item', 'density',
+})
+BOOLEAN_FILTERS = frozenset({'longitudinal', 'has_item_text'})
+
+
+class InvalidFilterValue(ValueError):
+    """A filter value cannot express the documented predicate."""
+
+
+def validate_filter_value(name, value):
+    if value is None:
+        return
+    if name in NUMERIC_FILTERS:
+        values = value if isinstance(value, list) else [value]
+        if len(values) not in (1, 2):
+            raise InvalidFilterValue(f'{name} requires a number or a one-/two-element list.')
+        for endpoint in values:
+            if endpoint is None and len(values) == 2:
+                continue
+            if isinstance(endpoint, (bool, np.bool_)) or not isinstance(endpoint, Real) or not math.isfinite(endpoint):
+                raise InvalidFilterValue(f'{name} requires finite numbers; null is allowed only as a range endpoint.')
+        if len(values) == 2 and all(v is not None for v in values) and values[0] > values[1]:
+            raise InvalidFilterValue(f'{name} range minimum must not exceed its maximum.')
+    elif name in BOOLEAN_FILTERS:
+        if not isinstance(value, (bool, np.bool_)):
+            raise InvalidFilterValue(f'{name} requires a boolean.')
+    else:
+        values = value if isinstance(value, list) else [value]
+        if not values or any(not isinstance(v, str) or not v.strip() for v in values):
+            raise InvalidFilterValue(f'{name} requires a non-empty string or list of non-empty strings.')
 
 
 def _require_column(df: pd.DataFrame, column: str) -> None:
@@ -36,9 +72,10 @@ def _apply_numeric_filter(
     """
     if value is None:
         return df
+    validate_filter_value(column, value)
     _require_column(df, column)
     
-    if isinstance(value, (int, float)):
+    if isinstance(value, Real):
         # Exact match
         mask = df[column] == value
     elif isinstance(value, list) and len(value) == 1:
@@ -346,6 +383,11 @@ def filter_tables(
     >>> filtered = irw.filter(n_categories=2)  # binary
     >>> filtered = irw.filter(n_categories=[3, 5])  # small multi-category
     """
+    # Validate before loading data, including when the catalogue is empty.
+    for filter_name, filter_value in locals().copy().items():
+        if filter_name != 'datasets':
+            validate_filter_value(filter_name, filter_value)
+
     # Get all tables with metadata
     df = list_tables(datasets)
     
@@ -440,4 +482,3 @@ def filter_tables(
     
     result = df['name'].sort_values().reset_index(drop=True)
     return result
-

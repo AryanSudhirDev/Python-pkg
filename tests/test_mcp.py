@@ -217,7 +217,9 @@ class FakeSource(GitHubSource):
         self.calls.append(url)
         if self.fail:
             raise ConnectionError("offline")
-        if url.endswith("trees/main?recursive=1"):
+        if url.endswith("commits/main"):
+            return json.dumps({"sha": "a" * 40})
+        if "/git/trees/" in url and url.endswith("?recursive=1"):
             return TREE_JSON
         if url.endswith("itemtext_issues.qmd"):
             return ISSUES_QMD
@@ -257,8 +259,11 @@ def test_search_delegates_filtering_to_the_package(tools):
 
 def test_search_accepts_every_filter_the_package_offers(tools):
     """A filter list kept by hand is a list that goes stale."""
+    from irw.operations.filter import BOOLEAN_FILTERS, NUMERIC_FILTERS
+
     for name in tools.backend.filter_names():
-        tools.search_tables(filters={name: "x"})
+        value = 10 if name in NUMERIC_FILTERS else True if name in BOOLEAN_FILTERS else "x"
+        tools.search_tables(filters={name: value})
 
 
 def test_search_rejects_a_filter_the_package_does_not_have(tools):
@@ -437,7 +442,9 @@ def test_version_stamp_degrades_to_a_warning_when_manifest_fails():
 
     result = IRWTools(BrokenManifest(), FakeSource()).search_tables()
     assert result["irw_version"] is None
-    assert any("not pinned" in warning for warning in result["warnings"])
+    assert result["version_status"] == "unavailable"
+    assert result["data_pinned"] is False
+    assert any("observed IRW version" in warning for warning in result["warnings"])
 
 
 def test_missing_credentials_are_an_error_not_a_hang(monkeypatch, tmp_path):
@@ -591,10 +598,12 @@ def test_fetch_of_an_uncatalogued_table_proceeds_bounded(tools):
     assert tools.backend.fetch_calls[-1]["max_rows"] == 1
 
 
-def test_an_uncatalogued_table_warns_when_it_must_be_downloaded_whole(tools):
+def test_an_uncatalogued_table_refuses_whole_table_download(tools):
     tools.backend.frames["off_catalogue"] = tools.backend.frames["alpha_depression"]
-    result = tools.fetch_table("off_catalogue", limit=1, dedup=True)
-    assert any("not in the IRW catalogue" in w for w in result["warnings"])
+    with pytest.raises(IRWMCPError) as error:
+        tools.fetch_table("off_catalogue", limit=1, dedup=True)
+    assert error.value.code == "table_size_unknown"
+    assert tools.backend.fetch_calls == []
 
 
 def test_itemtext_carries_rights_licence_and_public_notes(tools):
@@ -634,7 +643,7 @@ def test_processing_notes_exact_match_returns_the_header(tools):
     assert result["scripts"][0]["path"] == "data/alpha_depression.py"
     assert "row index" in result["scripts"][0]["header"]
     assert "import pandas" not in result["scripts"][0]["header"]
-    assert result["scripts"][0]["url"].startswith("https://github.com/ben-domingue/irw/blob/main/data/")
+    assert result["scripts"][0]["url"] == "https://github.com/ben-domingue/irw/blob/" + "a" * 40 + "/data/alpha_depression.py"
     assert result["validator_overrides"][0]["checks"] == "rt_units"
 
 
@@ -701,7 +710,7 @@ def test_a_truncated_github_listing_is_not_reported_as_a_missing_script():
 
     class _Truncated(FakeSource):
         def _fetch_text(self, url):
-            if url.endswith("trees/main?recursive=1"):
+            if "/git/trees/" in url and url.endswith("?recursive=1"):
                 return json.dumps(truncated)
             return super()._fetch_text(url)
 

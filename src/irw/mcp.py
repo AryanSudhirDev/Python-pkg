@@ -20,7 +20,7 @@ import sys
 import threading
 import warnings
 from collections.abc import Mapping
-from contextlib import redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
@@ -31,9 +31,11 @@ import pandas as pd
 import irw
 
 from .operations.list_tables import IRWMetadataUnavailable
+from .operations.filter import InvalidFilterValue, validate_filter_value
 from .utils.redivis.tables import _classify_error, _sanitize_error
 
 logger = logging.getLogger(__name__)
+_PACKAGE_CALL_LOCK = threading.RLock()
 
 SOURCE = "main"
 # The card returned per search hit. The full metadata record runs ~220 tokens,
@@ -58,6 +60,8 @@ SEARCH_DEFAULT_LIMIT = 20
 SEARCH_MAX_LIMIT = 100
 ROW_DEFAULT_LIMIT = 100
 ROW_MAX_LIMIT = 1000
+FETCH_MAX_WINDOW = 10_000
+PAYLOAD_MAX_BYTES = 256 * 1024
 ITEMTEXT_MAX_LIMIT = 500
 COLLECTION_DEFAULT_LIMIT = 100
 COLLECTION_MAX_LIMIT = 200
@@ -77,6 +81,7 @@ ITEMTEXT_ISSUES_QMD_URL = (
 ITEMTEXT_ISSUES_PAGE = "https://itemresponsewarehouse.org/itemtext_issues.html"
 PROCESSING_NOTES_MAX_LINES = 120
 PROCESSING_NOTES_MAX_CHARS = 8000
+PUBLIC_SOURCE_MAX_BYTES = 8 * 1024 * 1024
 
 # IRW records two licences per table: the Original License of the source
 # deposit and the Derived License IRW redistributes its own extract under.
@@ -115,7 +120,7 @@ _TAG_COLUMNS = (
 )
 
 AUTH_SETUP_MESSAGE = (
-    "No Redivis credentials were found. The Redivis SDK would open an "
+    "Usable Redivis credentials are unavailable or require renewed authorization. The Redivis SDK would open an "
     "interactive browser login, which cannot complete inside an MCP server. "
     "Authenticate once in a regular terminal with "
     "`python -c \"import irw; irw.list_tables()\"` (credentials are cached in "
@@ -190,6 +195,26 @@ class IRWBackend(Protocol):
 
 class PackageBackend:
     """Default backend that delegates to the public ``irw`` API."""
+
+    @contextmanager
+    def noninteractive(self):
+        """Block SDK browser fallback, including after a failed token refresh.
+
+        Called under the process-wide package lock because the SDK auth hook
+        and stdout/warning capture are process-global state.
+        """
+        from redivis.common import auth
+
+        original = auth.perform_oauth_login
+
+        def refuse_login(*args, **kwargs):
+            raise IRWMCPError("authentication_required", AUTH_SETUP_MESSAGE)
+
+        auth.perform_oauth_login = refuse_login
+        try:
+            yield
+        finally:
+            auth.perform_oauth_login = original
 
     def ensure_ready(self) -> None:
         """Refuse to start a Redivis call that would block on a browser login.
@@ -346,6 +371,8 @@ def _map_exception(error: Exception) -> IRWMCPError:
     """
     if isinstance(error, IRWMCPError):
         return error
+    if isinstance(error, InvalidFilterValue):
+        return IRWMCPError("invalid_input", str(error))
     if isinstance(error, IRWMetadataUnavailable):
         return IRWMCPError(
             "upstream_unavailable",
@@ -691,51 +718,88 @@ def _page_dataframe(
     }
 
 
+def _bound_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Bound complete records; never alter a value to make it fit."""
+    page_key = next((key for key in ('rows', 'items', 'tables', 'collections')
+                     if isinstance(payload.get(key), list) and 'offset' in payload), None)
+    if page_key:
+        payload['returned'] = len(payload[page_key])
+        payload['next_offset'] = (
+            payload['offset'] + payload['returned'] if payload.get('has_more') else None
+        )
+
+    def size():
+        return len(json.dumps({"result": payload}, ensure_ascii=False, allow_nan=False).encode('utf-8'))
+
+    if size() <= PAYLOAD_MAX_BYTES:
+        return payload
+    if page_key and payload[page_key]:
+        records = payload[page_key]
+        payload['has_more'] = True
+        payload['truncated'] = True
+        payload['warnings'].append('The payload size limit reduced this page; continue with next_offset.')
+        low, high = 0, len(records) - 1
+        while low < high:
+            count = (low + high + 1) // 2
+            payload[page_key] = records[:count]
+            payload['returned'] = count
+            payload['next_offset'] = payload['offset'] + count
+            if size() <= PAYLOAD_MAX_BYTES:
+                low = count
+            else:
+                high = count - 1
+        if low:
+            payload[page_key] = records[:low]
+            payload['returned'] = low
+            payload['next_offset'] = payload['offset'] + low
+            return payload
+    raise IRWMCPError(
+        'response_too_large',
+        'A complete record or metadata result exceeds the 256 KiB response limit. '
+        'Select fewer columns or retrieve the resource directly with the Python package.',
+    )
+
+
 def _http_get_text(url: str) -> str:
     """Fetch a public text resource. `requests` is a dependency of redivis."""
     import requests
 
-    response = requests.get(url, timeout=30, headers={"User-Agent": "irw-mcp"})
-    response.raise_for_status()
-    return response.text
+    import time
+
+    started = time.monotonic()
+    with requests.get(url, timeout=(5, 15), stream=True,
+                      headers={"User-Agent": "irw-mcp"}) as response:
+        response.raise_for_status()
+        chunks = []
+        size = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            size += len(chunk)
+            if size > PUBLIC_SOURCE_MAX_BYTES:
+                raise ValueError("Public source exceeds the download limit")
+            if time.monotonic() - started > 30:
+                raise TimeoutError("Public source exceeded the download deadline")
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8-sig")
 
 
 def _parse_issue_list(text: str) -> Dict[str, List[str]]:
-    """Parse the per-table issue list embedded in itemtext_issues.qmd.
+    """Parse the embedded YAML as data, without executing the surrounding R."""
+    import yaml
 
-    The page is generated from a YAML list of ``- table: name`` / ``issue: |-``
-    entries. That fixed shape is parsed directly rather than adding a YAML
-    dependency to the package for one file.
-    """
+    match = re.search(r'issues\s*<-\s*yaml\.load\(r"---\((.*?)\)---"\)', text, re.DOTALL)
+    if match is None:
+        raise ValueError("The public issue page has no recognized YAML issue block")
+    records = yaml.safe_load(match.group(1))
+    if not isinstance(records, list):
+        raise ValueError("The public issue block must be a list")
     issues: Dict[str, List[str]] = {}
-    table: Optional[str] = None
-    block: List[str] = []
-    in_block = False
-
-    def flush() -> None:
-        if table and block:
-            issues.setdefault(table.casefold(), []).append(
-                " ".join(line.strip() for line in block).strip()
-            )
-
-    for line in text.splitlines():
-        head = re.match(r"^- table:\s*(\S+)", line)
-        if head:
-            flush()
-            table, block, in_block = head.group(1), [], False
-            continue
-        if table is None:
-            continue
-        if re.match(r"^\s{2}issue:\s*[|>]", line):
-            in_block = True
-            continue
-        if in_block:
-            if line.strip() == "" or line.startswith("    "):
-                block.append(line)
-            else:
-                flush()
-                table, block, in_block = None, [], False
-    flush()
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Each public issue must be an object")
+        table, issue = record.get("table"), record.get("issue")
+        if not isinstance(table, str) or not table.strip() or not isinstance(issue, str) or not issue.strip():
+            raise ValueError("Each public issue requires nonempty table and issue strings")
+        issues.setdefault(table.strip().casefold(), []).append(issue.strip())
     return issues
 
 
@@ -776,7 +840,32 @@ def _script_header(text: str) -> Tuple[str, bool]:
     return joined, truncated
 
 
-_SCRIPT_SUFFIX = re.compile(r"\.(py|r|do|ipynb|txt|rdata|xlsx)$", re.IGNORECASE)
+_SCRIPT_SUFFIX = re.compile(r"\.(py|r|do|ipynb|txt)$", re.IGNORECASE)
+
+
+def _processing_header(path: str, text: str) -> Tuple[str, bool]:
+    if not path.lower().endswith(".ipynb"):
+        return _script_header(text)
+    notebook = json.loads(text)
+    blocks = []
+    for cell in notebook.get("cells", []):
+        source = cell.get("source", [])
+        source = source if isinstance(source, str) else "".join(source)
+        if cell.get("cell_type") == "markdown":
+            blocks.append(source)
+        elif cell.get("cell_type") == "code":
+            # Only actual leading comments, never executable notebook code.
+            comments = []
+            for line in source.splitlines():
+                if line.strip() and not line.lstrip().startswith("#"):
+                    break
+                comments.append(line)
+            blocks.append("\n".join(comments))
+            break
+    lines = "\n\n".join(blocks).strip().splitlines()
+    text = "\n".join(lines[:PROCESSING_NOTES_MAX_LINES])
+    truncated = len(lines) > PROCESSING_NOTES_MAX_LINES or len(text) > PROCESSING_NOTES_MAX_CHARS
+    return text[:PROCESSING_NOTES_MAX_CHARS], truncated
 
 
 def _match_scripts(table_name: str, paths: List[str]) -> Tuple[List[str], str]:
@@ -790,18 +879,24 @@ def _match_scripts(table_name: str, paths: List[str]) -> Tuple[List[str], str]:
     wanted = table_name.casefold()
     stems: Dict[str, List[str]] = {}
     for path in paths:
+        if not _SCRIPT_SUFFIX.search(path):
+            continue
         stem = _SCRIPT_SUFFIX.sub("", path.rsplit("/", 1)[-1]).casefold()
         stems.setdefault(stem, []).append(path)
     if wanted in stems:
-        return sorted(stems[wanted]), "exact"
+        paths = sorted(stems[wanted])
+        return paths, "exact" if len(paths) == 1 else "ambiguous"
     candidates = [
         stem
         for stem in stems
-        if len(stem) >= 8 and (wanted.startswith(stem) or stem.startswith(wanted))
+        if len(stem) >= 8 and (
+            any(wanted.startswith(stem + sep) or stem.startswith(wanted + sep)
+                for sep in ("_", "-", "."))
+        )
     ]
     if candidates:
-        best = max(candidates, key=len)
-        return sorted(stems[best]), "prefix"
+        matched = sorted(path for stem in candidates for path in stems[stem])
+        return matched, "prefix" if len(candidates) == 1 else "ambiguous"
     return [], "none"
 
 
@@ -819,10 +914,28 @@ class GitHubSource:
         self._issues: Optional[Dict[str, List[str]]] = None
         self._overrides: Optional[Dict[str, List[Dict[str, str]]]] = None
         self._files: Dict[str, str] = {}
+        self._commit: Optional[str] = None
+
+    def commit(self) -> str:
+        if self._commit is None:
+            payload = json.loads(self._fetch(f"https://api.github.com/repos/{IRW_REPO}/commits/main"))
+            sha = payload.get("sha", "")
+            if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                raise ValueError("GitHub did not return an immutable commit identifier")
+            self._commit = sha
+        return self._commit
+
+    def source_url(self, path: str) -> str:
+        return f"https://github.com/{IRW_REPO}/blob/{self.commit()}/{path}"
+
+    def _raw_url(self, path: str) -> str:
+        return f"https://raw.githubusercontent.com/{IRW_REPO}/{self.commit()}/{path}"
 
     def data_scripts(self) -> List[str]:
         if self._scripts is None:
-            payload = json.loads(self._fetch(IRW_REPO_TREE_URL))
+            payload = json.loads(self._fetch(
+                f"https://api.github.com/repos/{IRW_REPO}/git/trees/{self.commit()}?recursive=1"
+            ))
             # GitHub silently caps a recursive tree and says so only in this
             # flag. A capped listing looks exactly like a repository with
             # fewer scripts in it, which would turn "no processing notes for
@@ -842,7 +955,7 @@ class GitHubSource:
 
     def read_script(self, path: str) -> str:
         if path not in self._files:
-            self._files[path] = self._fetch(IRW_REPO_RAW_URL + path)
+            self._files[path] = self._fetch(self._raw_url(path))
         return self._files[path]
 
     def itemtext_issues(self) -> Dict[str, List[str]]:
@@ -854,7 +967,7 @@ class GitHubSource:
         if self._overrides is None:
             import csv
 
-            text = self._fetch(IRW_REPO_RAW_URL + "processing_notes/validator_overrides.csv")
+            text = self._fetch(self._raw_url("processing_notes/validator_overrides.csv"))
             overrides: Dict[str, List[Dict[str, str]]] = {}
             for row in csv.DictReader(io.StringIO(text)):
                 table = (row.get("table") or "").strip()
@@ -874,7 +987,7 @@ class IRWTools:
     ) -> None:
         self.backend = backend or PackageBackend()
         self.source = source or GitHubSource()
-        self._capture_lock = threading.Lock()
+        self._capture_lock = _PACKAGE_CALL_LOCK
         self._irw_version: Optional[str] = None
         self._irw_released_at: Optional[str] = None
         self._irw_version_checked = False
@@ -904,8 +1017,13 @@ class IRWTools:
                     continue
                 size = raw.get("n_responses")
                 try:
-                    n_responses = None if _is_missing(size) else int(float(size))
-                except (TypeError, ValueError):
+                    number = float(size)
+                    n_responses = (
+                        int(number) if not isinstance(size, (bool, np.bool_))
+                        and math.isfinite(number) and number >= 0
+                        and number.is_integer() else None
+                    )
+                except (TypeError, ValueError, OverflowError):
                     n_responses = None
                 licence = raw.get("Derived_License", raw.get("license"))
                 variables = raw.get("variables")
@@ -959,7 +1077,8 @@ class IRWTools:
         return rights, notes_warnings
 
     def _call(
-        self, callback: Callable[..., Any], *args: Any, **kwargs: Any
+        self, callback: Callable[..., Any], *args: Any,
+        requires_auth: bool = True, **kwargs: Any
     ) -> Tuple[Any, List[str]]:
         """Run package code without allowing stdout to corrupt MCP stdio."""
         callback_name = getattr(callback, "__name__", callback.__class__.__name__)
@@ -969,9 +1088,11 @@ class IRWTools:
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     try:
-                        if ensure_ready is not None:
+                        if requires_auth and ensure_ready is not None:
                             ensure_ready()
-                        value = callback(*args, **kwargs)
+                        guard = getattr(self.backend, "noninteractive", None)
+                        with guard() if requires_auth and guard else nullcontext():
+                            value = callback(*args, **kwargs)
                     except Exception as error:
                         if captured_stdout.getvalue().strip():
                             logger.debug(
@@ -983,12 +1104,12 @@ class IRWTools:
         return value, _warning_messages(caught)
 
     def _stamp(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Attach the IRW corpus version so any result can be pinned.
+        """Attach observed manifest provenance without claiming pinned reads.
 
         IRW is many independently versioned Redivis datasets; the manifest's
         ``irw_version`` is the only number that names the corpus as a whole.
         The manifest is fetched once per server process; when it cannot be
-        loaded, results ship unpinned with a warning rather than failing.
+        loaded, results carry a warning rather than failing.
         """
         if not self._irw_version_checked:
             self._irw_version_checked = True
@@ -996,7 +1117,7 @@ class IRWTools:
             stamp = None
             if stamp_fn is not None:
                 try:
-                    stamp, _ = self._call(stamp_fn)
+                    stamp, _ = self._call(stamp_fn, requires_auth=False)
                 except IRWMCPError:
                     stamp = None
             if stamp:
@@ -1005,15 +1126,18 @@ class IRWTools:
                 self._irw_released_at = str(released)
         payload["irw_version"] = self._irw_version
         payload["irw_released_at"] = self._irw_released_at
+        payload['retrieved_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
+        payload['version_status'] = 'observed_manifest' if self._irw_version else 'unavailable'
+        payload['data_pinned'] = False
         if self._irw_version is None:
             message = (
                 "The IRW version manifest could not be loaded; this result is "
-                "not pinned to an IRW version."
+                "not associated with an observed IRW version."
             )
             warning_list = payload.setdefault("warnings", [])
             if message not in warning_list:
                 warning_list.append(message)
-        return payload
+        return _bound_payload(payload)
 
     def filter_names(self) -> List[str]:
         """The package's own filter list, cached per process.
@@ -1023,7 +1147,7 @@ class IRWTools:
         is an assistant reporting that IRW cannot filter on something it can.
         """
         if self._filter_names is None:
-            names, _ = self._call(self.backend.filter_names)
+            names, _ = self._call(self.backend.filter_names, requires_auth=False)
             self._filter_names = [str(name) for name in names]
         return self._filter_names
 
@@ -1088,6 +1212,10 @@ class IRWTools:
                 )
             if value is None:
                 continue
+            try:
+                validate_filter_value(name, value)
+            except InvalidFilterValue as error:
+                raise IRWMCPError("invalid_input", str(error)) from None
             cleaned[name] = value
         return cleaned
 
@@ -1110,6 +1238,8 @@ class IRWTools:
         confident wrong answer rather than a missing feature.
         """
         query = _validate_text(query, "query", allow_empty=True)
+        if query and not re.search(r"\w", query, flags=re.UNICODE):
+            raise IRWMCPError("invalid_input", "query must contain searchable letters or numbers.")
         selected = self._validate_filters(filters)
         limit = _validate_limit(limit, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT)
         offset = _validate_offset(offset)
@@ -1139,6 +1269,7 @@ class IRWTools:
                         "offset": offset,
                         "limit": limit,
                         "has_more": False,
+                        "n_untagged_in_catalogue": None,
                         "filters_applied": selected,
                         "caveats": self._search_caveats(selected, None, None),
                         "warnings": state.warnings,
@@ -1276,7 +1407,9 @@ class IRWTools:
         """
         if not self._filter_descriptions:
             try:
-                descriptions, _ = self._call(self.backend.filter_descriptions)
+                descriptions, _ = self._call(
+                    self.backend.filter_descriptions, requires_auth=False
+                )
             except IRWMCPError:
                 descriptions = {}
             self._filter_descriptions = {
@@ -1345,7 +1478,7 @@ class IRWTools:
         # for nothing, and before the request. When the catalogue has no
         # variable list, the check is skipped rather than guessed at.
         known_columns = (facts or {}).get("variables")
-        if columns and known_columns:
+        if columns and known_columns and not wide:
             known = {str(column).casefold() for column in known_columns if column}
             unknown = [
                 column for column in columns if column.casefold() not in known
@@ -1359,21 +1492,19 @@ class IRWTools:
                 )
 
         needs_whole_table = wide or dedup
+        if not needs_whole_table and offset + limit > FETCH_MAX_WINDOW:
+            raise IRWMCPError(
+                'request_too_large',
+                f'offset + limit must not exceed {FETCH_MAX_WINDOW:,}; offset paging rereads preceding rows. '
+                'Use the Python package for larger exports.',
+            )
         max_rows: Optional[int] = None if needs_whole_table else offset + limit
         if needs_whole_table:
             reason = "wide=true" if wide else "dedup=true"
             if facts is None:
-                guard_warnings.append(
-                    f"'{table_name}' is not in the IRW catalogue, so its size "
-                    f"could not be checked before downloading it in full for "
-                    f"{reason}."
-                )
+                raise IRWMCPError('table_size_unknown', f'Cannot verify table size for {reason}; use an ordinary bounded preview.')
             elif facts.get("n_responses") is None:
-                guard_warnings.append(
-                    f"The catalogue has no response count for '{table_name}', "
-                    f"so its size could not be checked before downloading it "
-                    f"in full for {reason}."
-                )
+                raise IRWMCPError('table_size_unknown', f'No response count is available for {reason}; use an ordinary bounded preview.')
             elif facts["n_responses"] > FETCH_MAX_RESPONSES:
                 raise IRWMCPError(
                     "table_too_large",
@@ -1395,7 +1526,7 @@ class IRWTools:
             wide=wide,
             dedup=dedup,
             max_rows=max_rows,
-            columns=columns,
+            columns=None if wide else columns,
         )
         if frame is None:
             raise IRWMCPError("not_found", f"Table '{table_name}' was not found.")
@@ -1476,10 +1607,11 @@ class IRWTools:
                     "source": SOURCE,
                     "table": table_name,
                     "available": False,
+                    "availability_status": 'fetch_failed' if facts.get('has_item_text') is True else 'unavailable',
                     "rights": rights,
                     "items": [],
                     "columns": [],
-                    "total_items": 0,
+                    "total_items": None if facts.get('has_item_text') is True else 0,
                     "offset": offset,
                     "limit": limit,
                     "returned": 0,
@@ -1504,6 +1636,7 @@ class IRWTools:
                 "source": SOURCE,
                 "table": table_name,
                 "available": True,
+                "availability_status": 'available',
                 "rights": rights,
                 "disclaimer": ITEMTEXT_DISCLAIMER,
             }
@@ -1584,17 +1717,19 @@ class IRWTools:
             ) from None
         paths, match = _match_scripts(table_name, scripts)
         notes: List[Dict[str, Any]] = []
-        for path in paths[:5]:
+        if match == "ambiguous":
+            state.add("Several processing scripts match this table family; no script was selected. Inspect candidate_paths.")
+        for path in ([] if match == "ambiguous" else paths[:5]):
             try:
                 text = self.source.read_script(path)
+                header, truncated = _processing_header(path, text)
             except Exception as error:
                 state.add(f"Could not read {path} ({type(error).__name__}).")
                 continue
-            header, truncated = _script_header(text)
             notes.append(
                 {
                     "path": path,
-                    "url": IRW_REPO_BLOB_URL + path,
+                    "url": self.source.source_url(path),
                     "header": header,
                     "truncated": truncated,
                 }
@@ -1630,6 +1765,7 @@ class IRWTools:
                 "source": SOURCE,
                 "table": table_name,
                 "match": match,
+                "candidate_paths": paths,
                 "scripts": notes,
                 "validator_overrides": overrides,
                 "guides": {
@@ -1645,7 +1781,7 @@ class IRWTools:
 SERVER_INSTRUCTIONS = (
     "Read-only access to the Item Response Warehouse (IRW), a corpus of item "
     "response datasets in one long format (id, item, resp). Every response "
-    "carries irw_version, the citable version of the data; the server's own "
+    "carries an observed irw_version when available, not a pinned data snapshot; the server's own "
     "version number is the irw Python package, not the data. Before "
     "recommending a table, call get_processing_notes: facts metadata cannot "
     "express (whether id links people across waves, what a cov_* column really "
@@ -1723,6 +1859,40 @@ def create_server(
 
     from mcp.server.mcpserver.exceptions import ToolError
     from mcp.types import ToolAnnotations
+    from functools import wraps
+    import inspect
+    from typing import get_type_hints
+    from .mcp_models import OUTPUT_MODELS
+    from pydantic import ValidationError
+
+    def typed_tool(**options: Any) -> Callable:
+        """Preserve the result envelope while publishing concrete contracts."""
+        def decorate(function: Callable) -> Callable:
+            model = OUTPUT_MODELS[options["name"]]
+
+            @wraps(function)
+            def wrapped(*args: Any, **kwargs: Any) -> Any:
+                payload = function(*args, **kwargs)
+                try:
+                    normalized = model.model_validate({"result": payload}).model_dump(by_alias=True)["result"]
+                    return {"result": _bound_payload(normalized)}
+                except ValidationError:
+                    raise ToolError(str(IRWMCPError(
+                        "serialization_error", "IRW returned a result that violates the tool response schema."
+                    ))) from None
+                except IRWMCPError as error:
+                    raise ToolError(str(error)) from None
+
+            wrapped.__annotations__ = get_type_hints(function)
+            wrapped.__annotations__["return"] = model
+            signature = inspect.signature(function)
+            wrapped.__signature__ = signature.replace(
+                parameters=[parameter.replace(annotation=wrapped.__annotations__.get(name, parameter.annotation))
+                            for name, parameter in signature.parameters.items()],
+                return_annotation=model,
+            )
+            return server.tool(**options)(wrapped)
+        return decorate
 
     def deliver(call: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
         """Hand a structured error to the model instead of losing it.
@@ -1752,7 +1922,7 @@ def create_server(
     # decorator: the SDK reads the docstring at registration, so assigning
     # __doc__ afterwards registers an empty description and no test that only
     # calls the tool would notice.
-    @server.tool(
+    @typed_tool(
         name="search_tables",
         description=_search_tables_doc(tools),
         annotations=read_only,
@@ -1766,7 +1936,7 @@ def create_server(
     ) -> Dict[str, Any]:
         return deliver(lambda: tools.search_tables(query, filters, limit, offset))
 
-    @server.tool(name="describe_filter", annotations=read_only, structured_output=True)
+    @typed_tool(name="describe_filter", annotations=read_only, structured_output=True)
     def describe_filter(filter_name: str) -> Dict[str, Any]:
         """Explain one search filter and list the values it actually takes.
 
@@ -1777,12 +1947,12 @@ def create_server(
         """
         return deliver(lambda: tools.describe_filter(filter_name))
 
-    @server.tool(name="describe_table", annotations=read_only, structured_output=True)
+    @typed_tool(name="describe_table", annotations=read_only, structured_output=True)
     def describe_table(table_name: str) -> Dict[str, Any]:
         """Return metadata and statistics for one IRW table without fetching rows."""
         return deliver(lambda: tools.describe_table(table_name))
 
-    @server.tool(name="fetch_table", annotations=read_only, structured_output=True)
+    @typed_tool(name="fetch_table", annotations=read_only, structured_output=True)
     def fetch_table(
         table_name: str,
         limit: int = ROW_DEFAULT_LIMIT,
@@ -1794,8 +1964,9 @@ def create_server(
         """Fetch a bounded page of rows from one IRW table.
 
         The default page is 100 rows and the maximum is 1,000. The window is
-        bounded on the wire, so a page of a 100M-response table costs a page;
-        `columns` narrows it further and is worth passing. Rows come back
+        bounded on the wire to offset + limit, at most 10,000 rows. Later
+        pages reread the prefix. `columns` selects output columns, including
+        item columns after wide reshaping. Rows come back
         columnar: `columns` names the fields and each entry of `rows` is a
         list of values in that order.
 
@@ -1810,7 +1981,9 @@ def create_server(
         wide=true and dedup=true are the exception. Both describe the whole
         table, so they cannot be bounded to a page: the call downloads the
         table, warns that it did, and is refused above 1,000,000 responses
-        (error table_too_large).
+        (error table_too_large), or if size is unknown (table_size_unknown).
+        Application JSON is capped at 256 KiB. Follow next_offset when a page
+        is reduced; individual values are never shortened to fit.
 
         Response values keep the source's coding: higher resp is consistent
         within an item, but reverse-scored items are NOT recoded, so direction
@@ -1819,7 +1992,7 @@ def create_server(
         """
         return deliver(lambda: tools.fetch_table(table_name, limit, offset, columns, wide, dedup))
 
-    @server.tool(name="get_itemtext", annotations=read_only, structured_output=True)
+    @typed_tool(name="get_itemtext", annotations=read_only, structured_output=True)
     def get_itemtext(
         table_name: str,
         limit: int = ROW_DEFAULT_LIMIT,
@@ -1838,7 +2011,7 @@ def create_server(
         """
         return deliver(lambda: tools.get_itemtext(table_name, limit, offset))
 
-    @server.tool(name="list_collections", annotations=read_only, structured_output=True)
+    @typed_tool(name="list_collections", annotations=read_only, structured_output=True)
     def list_collections(
         limit: int = COLLECTION_DEFAULT_LIMIT,
         offset: int = 0,
@@ -1846,7 +2019,7 @@ def create_server(
         """List IRW's labelled collections and their metadata."""
         return deliver(lambda: tools.list_collections(limit, offset))
 
-    @server.tool(name="get_citation", annotations=read_only, structured_output=True)
+    @typed_tool(name="get_citation", annotations=read_only, structured_output=True)
     def get_citation(table_name: str) -> Dict[str, Any]:
         """Return BibTeX for the original data producers of one IRW table.
 
@@ -1854,7 +2027,7 @@ def create_server(
         """
         return deliver(lambda: tools.get_citation(table_name))
 
-    @server.tool(
+    @typed_tool(
         name="get_processing_notes", annotations=read_only, structured_output=True
     )
     def get_processing_notes(table_name: str) -> Dict[str, Any]:
